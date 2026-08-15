@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lernpfad memorizz — Kapitel 1: Orientierung</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --gray-10: #f4f4f4;  --gray-20: #e0e0e0;  --gray-30: #c6c6c6;
+    --gray-40: #a8a8a8;  --gray-50: #8d8d8d;  --gray-60: #6f6f6f;
+    --gray-70: #525252;  --gray-80: #393939;  --gray-90: #262626;  --gray-100: #161616;
+    --blue-10: #edf5ff;  --blue-20: #d0e2ff;  --blue-40: #78a9ff;
+    --blue-60: #0f62fe;  --blue-70: #0043ce;  --blue-80: #002d9c;
+    --red-10: #fff1f1;   --red-20: #ffd7d9;   --red-60: #da1e28;
+    --green-10: #defbe6; --green-30: #a7f0ba; --green-60: #198038;
+    --yellow-30: #f1c21b;
+    --background: #ffffff;
+    --layer-01: var(--gray-10);
+    --layer-02: var(--gray-20);
+    --text-primary: var(--gray-100);
+    --text-secondary: var(--gray-70);
+    --text-helper: var(--gray-60);
+    --text-on-color: #ffffff;
+    --border-subtle: var(--gray-20);
+    --border-strong: var(--gray-50);
+    --link-primary: var(--blue-60);
+    --link-primary-hover: var(--blue-70);
+    --interactive: var(--blue-60);
+    --support-error: var(--red-60);
+    --support-success: var(--green-60);
+    --support-warning: var(--yellow-30);
+    --spacing-01: 2px;   --spacing-02: 4px;   --spacing-03: 8px;
+    --spacing-04: 12px;  --spacing-05: 16px;  --spacing-06: 24px;
+    --spacing-07: 32px;  --spacing-08: 40px;  --spacing-09: 48px;
+    --spacing-10: 64px;  --spacing-11: 80px;
+    --font-sans: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--background); color: var(--text-primary); font-family: var(--font-sans);
+         font-size: 15px; line-height: 1.5; padding: var(--spacing-09) var(--spacing-06) var(--spacing-11); }
+  .page { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: var(--spacing-09); }
+  @media (max-width: 960px) { .page { grid-template-columns: 1fr; } aside { order: 2; position: static; } }
+  header { grid-column: 1 / -1; }
+  h1 { font-weight: 300; font-size: 32px; line-height: 1.2; letter-spacing: -0.01em; margin-bottom: var(--spacing-05); }
+  h2 { font-weight: 400; font-size: 21px; margin: var(--spacing-08) 0 var(--spacing-04); }
+  h3 { font-weight: 500; font-size: 16px; margin: var(--spacing-06) 0 var(--spacing-03); }
+  p { margin-bottom: var(--spacing-04); max-width: 680px; }
+  a { color: var(--link-primary); text-underline-offset: 3px; }
+  ul, ol { padding-left: var(--spacing-06); margin-bottom: var(--spacing-04); max-width: 680px; }
+  li { margin-bottom: var(--spacing-02); }
+  code { font-family: var(--font-mono); font-size: 13px; background: var(--layer-01); padding: 1px var(--spacing-02); border-radius: 4px; }
+  pre { font-family: var(--font-mono); font-size: 13px; background: var(--gray-100); color: #f4f4f4; padding: var(--spacing-05); overflow-x: auto; margin-bottom: var(--spacing-05); line-height: 1.6; }
+  pre code { background: transparent; padding: 0; color: inherit; }
+  .eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-helper); margin-bottom: var(--spacing-03); }
+  .lead { font-size: 17px; color: var(--text-secondary); max-width: 680px; margin-bottom: var(--spacing-06); }
+
+  aside.glossary { position: sticky; top: var(--spacing-07); align-self: start; border: 1px solid var(--border-subtle); background: var(--layer-01); padding: var(--spacing-05); }
+  aside.glossary .label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-secondary); margin-bottom: var(--spacing-04); }
+  aside.glossary dl dt { font-weight: 500; margin-top: var(--spacing-04); font-size: 13.5px; }
+  aside.glossary dl dt:first-child { margin-top: 0; }
+  aside.glossary dl dd { font-size: 12.5px; line-height: 1.45; color: var(--text-secondary); margin-top: var(--spacing-01); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: var(--spacing-04) 0 var(--spacing-05); }
+  th, td { text-align: left; padding: var(--spacing-03) var(--spacing-04); border-bottom: 1px solid var(--border-subtle); vertical-align: top; }
+  th { font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); font-weight: 500; }
+  td.num { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-helper); white-space: nowrap; }
+  .table-wrap { overflow-x: auto; }
+
+  .chip { display: inline-flex; align-items: center; gap: var(--spacing-03); padding: var(--spacing-01) var(--spacing-03); border-radius: 4px; border: 1px solid var(--border-subtle); font-family: var(--font-mono); font-size: 11.5px; background: var(--background); white-space: nowrap; }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .chip.now { background: var(--blue-10); border-color: var(--blue-20); }
+  .chip.now .dot { background: var(--interactive); }
+  .chip.done .dot { background: var(--support-success); }
+  .chip.open .dot { background: var(--gray-40); }
+
+  .callout { border-left: 3px solid var(--interactive); background: var(--blue-10); padding: var(--spacing-04) var(--spacing-05); margin: var(--spacing-05) 0; max-width: 680px; }
+  .callout.warn { border-left-color: var(--support-warning); background: #fff8e1; }
+  .callout.task { border-left-color: var(--support-success); background: var(--green-10); }
+  .callout p, .callout ul, .callout ol { margin-bottom: var(--spacing-03); }
+  .callout p:last-child, .callout ul:last-child, .callout ol:last-child { margin-bottom: 0; }
+  .callout .label { font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-secondary); margin-bottom: var(--spacing-02); }
+
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: var(--spacing-02) var(--spacing-05); font-size: 14px; max-width: 680px; margin-bottom: var(--spacing-05); }
+  .kv dt { color: var(--text-helper); font-family: var(--font-mono); font-size: 12px; }
+  .kv dd { color: var(--text-primary); }
+
+  .diagram { border: 1px solid var(--border-subtle); padding: var(--spacing-05); margin: var(--spacing-04) 0 var(--spacing-06); background: var(--background); max-width: 760px; }
+  .diagram svg { display: block; width: 100%; height: auto; }
+  .diagram .cap { font-size: 12.5px; color: var(--text-helper); margin-top: var(--spacing-03); }
+
+  .code { background: var(--gray-100); padding: var(--spacing-05); overflow-x: auto; margin: var(--spacing-04) 0 var(--spacing-05); }
+  .code pre { padding: 0; margin: 0; background: transparent; }
+  .code .kw { color: #78a9ff; } .code .str { color: #a7f0ba; } .code .cm { color: #8d8d8d; } .code .fn { color: #be95ff; }
+  .code .ln { color: #6f6f6f; user-select: none; display: inline-block; width: 2.2em; }
+
+  .path { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-secondary); }
+  .steps { counter-reset: s; list-style: none; padding-left: 0; }
+  .steps li { position: relative; padding-left: 36px; margin-bottom: var(--spacing-03); }
+  .steps li::before { counter-increment: s; content: counter(s); position: absolute; left: 0; top: 1px; width: 24px; height: 24px; border-radius: 50%; background: var(--interactive); color: #fff; font-family: var(--font-mono); font-size: 12px; display: flex; align-items: center; justify-content: center; }
+  .next { border-top: 1px solid var(--border-subtle); margin-top: var(--spacing-08); padding-top: var(--spacing-05); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="eyebrow">Lernpfad · memorizz 0.5.1 · Kapitel 1 von 11</div>
+    <h1>memorizz verstehen — Schritt für Schritt</h1>
+    <p class="lead">
+      Wir gehen das Repository so durch, wie man ein fremdes System am besten lernt: erst das Problem
+      und die Grundidee, dann das mentale Modell, dann Schicht für Schicht in den Code. Jedes Kapitel
+      beantwortet drei Fragen — <em>Was ist es?</em>, <em>Warum gibt es das / was bringt es?</em>,
+      <em>Wo steht es im Code?</em> — und endet mit Kontrollfragen und einer kleinen Übung.
+    </p>
+  </header>
+
+  <main>
+
+    <h2 id="lernpfad">Der Lernpfad</h2>
+    <p>Elf Kapitel, grob vom Groben ins Feine. Du kannst jederzeit die Reihenfolge ändern oder ein Kapitel überspringen — sag einfach Bescheid.</p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Kapitel</th><th>Was du danach kannst</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td><strong>Orientierung</strong> — Problem, Grundidee, die drei Säulen, Repo-Landkarte</td><td>Erklären, wozu memorizz da ist und wie das Repo aufgebaut ist</td><td><span class="chip now"><span class="dot"></span>jetzt</span></td></tr>
+        <tr><td class="num">2</td><td><strong>Der Agent</strong> — <code>MemAgent</code>, <code>MemAgentBuilder</code>, <code>ApplicationMode</code>, Manager, der Ablauf von <code>agent.run()</code></td><td>Einen Agenten konfigurieren und nachvollziehen, was bei einem Aufruf passiert</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">3</td><td><strong>Die Memory-Typen</strong> — semantisch, prozedural, episodisch, kurzfristig, geteilt</td><td>Für jeden der 13 <code>MemoryType</code>s sagen, was er speichert und wann er hilft</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">4</td><td><strong>Speicherung</strong> — <code>MemoryProvider</code>-Interface, Filesystem+FAISS, MongoDB, Oracle, Embeddings &amp; Vektorsuche</td><td>Verstehen, wie eine Erinnerung gespeichert und wiedergefunden wird</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">5</td><td><strong>Modelle</strong> — <code>llms/</code>, <code>embeddings/</code>, Rollen, Prompt-Caching, lokale Modelle</td><td>Beliebige LLM/Embedding-Backends anschließen</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">6</td><td><strong>Kontext-Effizienz</strong> — Retrieval, Dedup/MMR, Summaries, Semantic Cache, Token-Statistiken</td><td>Erklären, warum das Kontextfenster klein und günstig bleibt</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">7</td><td><strong>Tools &amp; Fähigkeiten</strong> — Toolbox, Policies, Approvals, Internet, Sandbox, Browser, MCP-Client, Skills-Marktplatz, Automationen</td><td>Einem Agenten sicher Werkzeuge geben</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">8</td><td><strong>Multi-Agent</strong> — Shared Memory, Orchestratoren, Deep-Research-Workflow, Delegation</td><td>Mehrere Agenten koordinieren</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">9</td><td><strong>Continual Learning</strong> — Workflow-Memory → Skillbox, Promotion, Shadow-Evaluation</td><td>Verstehen, wie ein Agent aus Erfolgen wiederverwendbare Skills macht</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">10</td><td><strong>Oberflächen</strong> — CLI, Web-UI, MCP-Server, Desktop-Shell, npm-Installer</td><td>Alle Wege kennen, memorizz zu bedienen und auszuliefern</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+        <tr><td class="num">11</td><td><strong>Qualität &amp; Betrieb</strong> — Tests, CI/CD, Docs, LongMemEval, Release, Governance, Multi-Tenant</td><td>Beurteilen, wie reif das Projekt ist und wie man beiträgt</td><td><span class="chip open"><span class="dot"></span>offen</span></td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════════════ -->
+    <h2 id="k1">Kapitel 1 — Orientierung</h2>
+
+    <h3 id="k1-problem">1.1 Das Problem, das memorizz löst</h3>
+    <p>
+      Ein Sprachmodell hat kein Gedächtnis. Jeder Aufruf beginnt bei null; alles, was das Modell
+      „wissen“ soll, muss in dieser einen Anfrage im Kontextfenster stehen. Das hat drei praktische Folgen:
+    </p>
+    <ul>
+      <li><strong>Vergessen.</strong> Was der Nutzer gestern gesagt hat, was ein Tool letzte Woche ergab, welche Vorgehensweise schon einmal funktioniert hat — weg, sobald die Session endet.</li>
+      <li><strong>Kosten und Grenzen.</strong> Alles in den Prompt zu stopfen ist teuer (Tokens) und stößt schnell an das Kontextfenster.</li>
+      <li><strong>Falsche Erinnerung.</strong> Wer naiv „alles Ähnliche“ aus einer Vektor-Datenbank in den Prompt kippt, bekommt Dubletten, Widersprüche und veraltete Fakten.</li>
+    </ul>
+    <p>
+      Klassisches RAG (Dokumente einbetten, ähnliche Passagen suchen) löst nur einen Teil davon: das
+      <em>Faktenwissen</em>. Ein Agent braucht aber mehrere Arten von Gedächtnis — und genau das ist die
+      Grundidee von memorizz: <strong>Gedächtnis nach kognitiver Rolle trennen</strong>, so wie man es aus
+      der Kognitionspsychologie kennt.
+    </p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rolle</th><th>Beispiel beim Menschen</th><th>Im Agenten</th><th>Paket</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Semantisch</strong></td><td>Fakten, Wissen, „wer bin ich“</td><td>Wissensbasis, Persona (Identität des Agenten), Entity-Memory (Fakten über Personen/Dinge)</td><td class="path">long_term/semantic/</td></tr>
+        <tr><td><strong>Prozedural</strong></td><td>Können, Routinen</td><td>Toolbox (Werkzeuge), Workflow-Memory (Ablauf-Zustand), Skillbox (gelernte Skills)</td><td class="path">long_term/procedural/</td></tr>
+        <tr><td><strong>Episodisch</strong></td><td>Erlebtes, „was ist passiert“</td><td>Konversationsverlauf, Zusammenfassungen</td><td class="path">long_term/episodic/</td></tr>
+        <tr><td><strong>Kurzzeit</strong></td><td>Arbeitsgedächtnis</td><td>Semantic Cache (Antwort-Cache für ähnliche Fragen), Zwischenergebnisse</td><td class="path">short_term_memory/</td></tr>
+        <tr><td><strong>Geteilt</strong></td><td>Team-Whiteboard</td><td>Shared Memory / Blackboard für mehrere Agenten</td><td class="path">coordination/</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3 id="k1-was">1.2 Was memorizz ist — und was es dir bringt</h3>
+    <p>
+      In einem Satz: <strong>memorizz ist ein Python-Framework für „memory-augmented“ KI-Agenten</strong> —
+      es liefert die Gedächtnis-Systeme, die Speicherung dahinter, eine Agenten-Laufzeit, die damit
+      arbeitet, und fertige Oberflächen (Terminal-CLI, Web-UI, MCP-Server). Konkret bekommst du:
+    </p>
+    <ul>
+      <li><strong>Persistenz über Sessions hinweg</strong> — <code>agent.run("Ich heiße Leah …")</code>, Prozess beenden, neu starten, <code>agent.run("Was weißt du über meine Arbeit?")</code> funktioniert.</li>
+      <li><strong>Semantische Suche</strong> — Erinnerungen werden als Vektoren (Embeddings) abgelegt und nach Bedeutung, nicht nach Stichwort gefunden.</li>
+      <li><strong>Austauschbare Speicher</strong> — derselbe Agent-Code läuft auf Dateisystem (lokal, mit FAISS), MongoDB oder Oracle. Für den Einstieg brauchst du keine Datenbank.</li>
+      <li><strong>Werkzeuge mit Leitplanken</strong> — Python-Funktionen werden automatisch zu Tools; riskante Aktionen (Browser, Code-Ausführung, MCP-Mutationen) brauchen eine dauerhafte Freigabe durch den Host.</li>
+      <li><strong>Mandantenfähigkeit</strong> — ein Agent, viele Endnutzer, sauber getrennt über <code>user_id</code>.</li>
+      <li><strong>Sparsamer Kontext</strong> — Deduplizierung, Zusammenfassungen, Semantic Cache und prompt-cache-freundlicher Aufbau halten Token-Kosten klein.</li>
+      <li><strong>Sofort benutzbar</strong> — <code>pip install memorizz</code> und <code>memorizz</code> im Terminal startet einen Claude-Code-ähnlichen Agenten mit Gedächtnis; mit laufendem Ollama sogar komplett ohne API-Key.</li>
+    </ul>
+    <div class="callout warn">
+      <div class="label">Ehrliche Einordnung</div>
+      <p>Das README nennt memorizz ausdrücklich <em>experimentell/educational</em>: APIs können sich ändern, es gab kein Security-Hardening für Produktion. Und: Die Lizenz ist <strong>PolyForm Noncommercial 1.0.0</strong> — Nutzung nur nicht-kommerziell (siehe <code>LICENSE</code>, <code>NOTICE</code>). Beides gehört zu „was es bringt“: hervorragend zum Lernen, Prototypen und Forschen; für ein kommerzielles Produkt brauchst du eine andere Lizenzgrundlage.</p>
+    </div>
+
+    <h3 id="k1-saeulen">1.3 Das mentale Modell: drei Säulen + zwei Anbauten</h3>
+    <p>Wenn du nur eine Sache aus diesem Kapitel mitnimmst, dann dieses Bild:</p>
+    <div class="diagram">
+      <svg viewBox="0 0 864 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Drei Säulen von memorizz">
+        <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8d8d8d"/></marker></defs>
+        <!-- Runtime -->
+        <rect x="238" y="16" width="360" height="70" rx="4" fill="#edf5ff" stroke="#0f62fe"/>
+        <text x="418" y="42" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="14" font-weight="600" fill="#161616">Säule C · Agent-Laufzeit</text>
+        <text x="418" y="62" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#525252">memagent/ — MemAgent, Builder, Manager</text>
+        <text x="418" y="78" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="11.5" fill="#6f6f6f">wer liest/schreibt und mit LLM + Tools arbeitet</text>
+        <!-- Memory systems -->
+        <rect x="238" y="120" width="360" height="70" rx="4" fill="#ffffff" stroke="#8d8d8d"/>
+        <text x="418" y="146" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="14" font-weight="600" fill="#161616">Säule A · Memory-Systeme</text>
+        <text x="418" y="166" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#525252">long_term/ · short_term_memory/ · coordination/</text>
+        <text x="418" y="182" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="11.5" fill="#6f6f6f">was gespeichert wird — nach kognitiver Rolle</text>
+        <!-- Providers -->
+        <rect x="238" y="224" width="360" height="62" rx="4" fill="#ffffff" stroke="#8d8d8d"/>
+        <text x="418" y="248" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="14" font-weight="600" fill="#161616">Säule B · Storage-Provider</text>
+        <text x="418" y="268" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#525252">memory_provider/ — filesystem · mongodb · oracle</text>
+        <!-- arrows -->
+        <line x1="418" y1="86" x2="418" y2="118" stroke="#8d8d8d" stroke-width="1.5" marker-end="url(#a)"/>
+        <text x="428" y="106" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="11" fill="#525252">abrufen · speichern</text>
+        <line x1="418" y1="190" x2="418" y2="222" stroke="#8d8d8d" stroke-width="1.5" marker-end="url(#a)"/>
+        <text x="428" y="210" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="11" fill="#525252">MemoryProvider-Interface</text>
+        <!-- side: models -->
+        <rect x="8" y="30" width="170" height="56" rx="4" fill="#f4f4f4" stroke="#c6c6c6"/>
+        <text x="93" y="52" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="13" font-weight="600" fill="#161616">Modelle</text>
+        <text x="93" y="70" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#525252">llms/ · embeddings/</text>
+        <line x1="236" y1="52" x2="180" y2="52" stroke="#8d8d8d" stroke-width="1.5" marker-end="url(#a)"/>
+        <text x="208" y="44" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="10" fill="#6f6f6f">LLM-Aufrufe</text>
+        <line x1="93" y1="86" x2="93" y2="252" stroke="#8d8d8d" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <line x1="93" y1="252" x2="236" y2="252" stroke="#8d8d8d" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#a)"/>
+        <text x="100" y="245" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="10" fill="#6f6f6f">Embeddings → Vektoren</text>
+        <!-- side: capabilities -->
+        <rect x="658" y="22" width="198" height="86" rx="4" fill="#f4f4f4" stroke="#c6c6c6"/>
+        <text x="757" y="44" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="13" font-weight="600" fill="#161616">Fähigkeiten (optional)</text>
+        <text x="757" y="62" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#525252">internet_access/ · sandbox/</text>
+        <text x="757" y="78" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#525252">browser_control/ · mcp/</text>
+        <text x="757" y="94" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#525252">automation/ · vercel_skills/ …</text>
+        <line x1="656" y1="52" x2="600" y2="52" stroke="#8d8d8d" stroke-width="1.5" marker-end="url(#a)"/>
+        <text x="628" y="44" text-anchor="middle" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="10" fill="#6f6f6f">liefern Tools</text>
+      </svg>
+      <div class="cap">Die Laufzeit (C) benutzt die Memory-Systeme (A); die wissen nichts über Datenbanken, sondern reden nur mit dem <code>MemoryProvider</code>-Interface (B). Deshalb kannst du das Backend tauschen, ohne Agent- oder Memory-Logik anzufassen.</div>
+    </div>
+    <dl class="kv">
+      <dt>Säule A</dt><dd><strong>Memory-Systeme</strong> — <span class="path">src/memorizz/long_term/</span>, <span class="path">short_term_memory/</span>, <span class="path">coordination/</span>. Fachlogik: was ist eine Persona, wie wird eine Wissensbasis in Chunks zerlegt, wann wird zusammengefasst.</dd>
+      <dt>Säule B</dt><dd><strong>Storage-Provider</strong> — <span class="path">src/memorizz/memory_provider/</span>. Ein abstraktes Interface (<code>base.py</code>: <code>store</code>, <code>retrieve_by_query</code>, <code>retrieve_by_id</code>, <code>list_all</code>, <code>update_by_id</code>, <code>delete_*</code>, …) und drei Implementierungen.</dd>
+      <dt>Säule C</dt><dd><strong>Agent-Laufzeit</strong> — <span class="path">src/memorizz/memagent/</span>. <code>MemAgent</code> (<code>core.py</code>, 6 900 Zeilen — das Herz), <code>MemAgentBuilder</code>, elf Manager (Memory, Tool, Cache, Persona, …), Orchestratoren.</dd>
+      <dt>Anbau 1</dt><dd><strong>Modelle</strong> — <span class="path">llms/</span> (OpenAI, Anthropic, Azure, Ollama, HuggingFace, MLX) und <span class="path">embeddings/</span> (OpenAI, Azure, Ollama, HuggingFace, VoyageAI).</dd>
+      <dt>Anbau 2</dt><dd><strong>Fähigkeiten</strong> — Internetzugang, Sandbox-Codeausführung, Browser-Steuerung, MCP-Client, Skills-Marktplatz, Automationen. Jede Fähigkeit hängt sich als Tool-Satz an den Agenten; keine ersetzt das Memory-Modell.</dd>
+    </dl>
+
+    <h3 id="k1-code">1.4 Ein erster Blick auf Code: der Quickstart, Zeile für Zeile</h3>
+    <p>Das ist der Einstieg aus dem README (<span class="path">README.md:85–122</span>). Lies ihn einmal mit dem Drei-Säulen-Bild im Kopf:</p>
+    <div class="code"><pre><span class="ln">1</span><span class="kw">from</span> memorizz.memagent.builders <span class="kw">import</span> MemAgentBuilder          <span class="cm"># Säule C</span>
+<span class="ln">2</span><span class="kw">from</span> memorizz.memory_provider <span class="kw">import</span> FileSystemConfig, FileSystemProvider  <span class="cm"># Säule B</span>
+<span class="ln">3</span>
+<span class="ln">4</span>provider = <span class="fn">FileSystemProvider</span>(<span class="fn">FileSystemConfig</span>(
+<span class="ln">5</span>    root_path=Path(<span class="str">"~/.memorizz"</span>).expanduser(),      <span class="cm"># wohin: lokaler Ordner</span>
+<span class="ln">6</span>    embedding_provider=<span class="str">"openai"</span>,                       <span class="cm"># Anbau 1: wer macht Vektoren</span>
+<span class="ln">7</span>    embedding_config={<span class="str">"model"</span>: <span class="str">"text-embedding-3-small"</span>},
+<span class="ln">8</span>))
+<span class="ln">9</span>
+<span class="ln">10</span>agent = (
+<span class="ln">11</span>    <span class="fn">MemAgentBuilder</span>()
+<span class="ln">12</span>    .with_instruction(<span class="str">"You are a helpful assistant with persistent memory."</span>)
+<span class="ln">13</span>    .with_memory_provider(provider)                    <span class="cm"># C bekommt B</span>
+<span class="ln">14</span>    .with_llm_config({<span class="str">"provider"</span>: <span class="str">"openai"</span>, <span class="str">"model"</span>: <span class="str">"gpt-4o-mini"</span>, <span class="str">"api_key"</span>: …})  <span class="cm"># Anbau 1</span>
+<span class="ln">15</span>    .with_semantic_cache(enabled=<span class="kw">True</span>, threshold=<span class="str">0.85</span>)  <span class="cm"># Säule A: Kurzzeit-Cache</span>
+<span class="ln">16</span>    .build()
+<span class="ln">17</span>)
+<span class="ln">18</span>
+<span class="ln">19</span><span class="kw">print</span>(agent.run(<span class="str">"Hi, my name is Leah and I work on payments systems."</span>))
+<span class="ln">20</span><span class="kw">print</span>(agent.run(<span class="str">"What did I tell you about my work?"</span>))   <span class="cm"># Antwort kommt aus dem Gedächtnis</span>
+<span class="ln">21</span><span class="kw">print</span>(agent.get_context_window_stats())               <span class="cm"># Token-Statistik des letzten Turns</span></pre></div>
+    <p>Drei Beobachtungen, die später wichtig werden:</p>
+    <ul>
+      <li>Der <strong>Provider</strong> bekommt die Embedding-Konfiguration, nicht der Agent — denn Vektoren entstehen dort, wo gespeichert und gesucht wird.</li>
+      <li>Ohne <code>.with_application_mode(...)</code> gilt der Standard <code>ASSISTANT</code> (<span class="path">enums/application_mode.py:23</span>). Der Modus entscheidet, welche Memory-Typen aktiv sind — Zeile 33–56 derselben Datei ist die Tabelle dazu.</li>
+      <li><code>agent.run()</code> gibt einfach einen String zurück. Alles Interessante (Abruf, Dedup, Speichern) passiert dahinter — das ist Kapitel 2.</li>
+    </ul>
+
+    <h3 id="k1-vokabeln">1.5 Das Vokabular: <code>MemoryType</code>, <code>ApplicationMode</code>, die drei IDs</h3>
+    <p>
+      <strong><code>MemoryType</code></strong> (<span class="path">src/memorizz/enums/memory_type.py:31–46</span>) zählt die 13 Speicher-„Fächer“ auf:
+      <code>KNOWLEDGE_BASE</code>, <code>PERSONAS</code>, <code>ENTITY_MEMORY</code>, <code>TOOLBOX</code>, <code>WORKFLOW_MEMORY</code>,
+      <code>SKILLBOX</code>, <code>CONVERSATION_MEMORY</code>, <code>SUMMARIES</code>, <code>SHORT_TERM_MEMORY</code>,
+      <code>SEMANTIC_CACHE</code>, <code>TOOL_LOG</code>, <code>SHARED_MEMORY</code>, <code>MEMAGENT</code>. Jedes Fach ist beim
+      Provider eine eigene Sammlung (Collection/Tabelle/Ordner). Nettes Detail: die Datei akzeptiert noch den
+      alten Namen <code>LONG_TERM_MEMORY</code> für <code>KNOWLEDGE_BASE</code>, damit alte Datensätze weiter laden — ein
+      Hinweis darauf, dass hier auf Abwärtskompatibilität geachtet wird.
+    </p>
+    <p>
+      <strong><code>ApplicationMode</code></strong> (<span class="path">enums/application_mode.py</span>) sind Voreinstellungen, welche Fächer ein Agent benutzt:
+    </p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Modus</th><th>Aktive Memory-Typen</th><th>Gedacht für</th></tr></thead>
+      <tbody>
+        <tr><td><code>assistant</code> (Standard)</td><td>conversation_memory · knowledge_base · personas · entity_memory · short_term_memory · summaries</td><td>Persistenter Gesprächsassistent mit Personalisierung</td></tr>
+        <tr><td><code>workflow</code></td><td>workflow_memory · toolbox · knowledge_base · short_term_memory · summaries</td><td>Strukturierte Aufgaben-/Tool-Pipelines</td></tr>
+        <tr><td><code>deep_research</code></td><td>toolbox · shared_memory · knowledge_base · short_term_memory · summaries</td><td>Recherche mit mehreren kooperierenden Agenten</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>
+      <strong>Die drei IDs.</strong> memorizz adressiert Gedächtnis hierarchisch (<span class="path">docs/guides/multi-tenant.md:8</span>):
+      <code>user_id → agent_id → memory_id → thread_id</code>. <code>user_id</code> ist die Mandantengrenze (wird bei jedem
+      Lesen/Schreiben erzwungen), <code>agent_id</code> identifiziert den gespeicherten Agenten, <code>memory_id</code> einen
+      Gedächtnisraum innerhalb des Agenten, <code>thread_id</code> einen Gesprächsfaden. Alle sind Parameter von
+      <code>agent.run()</code> (<span class="path">memagent/core.py:3252–3260</span>) — also pro Aufruf wählbar, nicht fest verdrahtet.
+    </p>
+
+    <h3 id="k1-run">1.6 Was bei <code>agent.run()</code> passiert — der Überblick</h3>
+    <p>Die Architektur-Notiz des Projekts (<span class="path">src/memorizz/MEMORY_ARCHITECTURE.md:89–96</span>) beschreibt den Ablauf so — Kapitel 2 folgt ihm dann durch den Code:</p>
+    <ol class="steps">
+      <li><code>memory_id</code> / <code>thread_id</code> (und <code>user_id</code>-Scope) auflösen</li>
+      <li>Semantic Cache prüfen — bei Treffer sofort antworten, ohne LLM</li>
+      <li>Aktive Erinnerungen abrufen, <strong>deduplizieren</strong> (exakter Hash, Kosinus ≥ 0,95, gegen die Historie), per MMR auswählen und in einen prompt-cache-freundlichen Kontext bauen</li>
+      <li>LLM/Tool-Schleife ausführen (Tools kommen aus Toolbox + Fähigkeiten; heikle Tools warten auf Freigabe)</li>
+      <li>Nutzer- und Assistentenbeitrag persistieren</li>
+      <li>Kontextfenster-Statistik und Zusammenfassungs-Registry aktualisieren</li>
+    </ol>
+
+    <h3 id="k1-landkarte">1.7 Landkarte des Repositories</h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ordner</th><th>Inhalt</th><th>Warum es das gibt</th></tr></thead>
+      <tbody>
+        <tr><td class="path">src/memorizz/</td><td>Das Paket: 21 Unterpakete, 197 Dateien, ~69k Zeilen. Größte: <code>memagent</code> 13,7k · <code>memory_provider</code> 13,0k · <code>ui</code> 11,8k</td><td>„src-Layout“: das Paket ist nur importierbar, wenn installiert (<code>pip install -e .</code>) — verhindert versehentliche Imports aus dem Arbeitsverzeichnis</td></tr>
+        <tr><td class="path">src/memorizz/__init__.py</td><td>Öffentliche API, <em>lazy</em> per PEP 562 (Zeile 5–13, 27–100)</td><td><code>import memorizz</code> soll fast nichts kosten, damit die CLI schnell startet; schwere Module laden erst beim Zugriff</td></tr>
+        <tr><td class="path">tests/</td><td>76 Dateien / 667 Tests: <code>unit</code>, <code>integration</code>, <code>performance</code>, <code>fixtures</code>, <code>mocks</code></td><td>Deterministische Suite ohne echte API-Keys (mongomock, Offline-Provider) — läuft in CI auf Python 3.10 &amp; 3.12</td></tr>
+        <tr><td class="path">docs/ + mkdocs.yml</td><td>MkDocs-Material-Site: Getting Started, Guides, Memory-Typen, Provider, Use-Cases</td><td>Wird bei jedem Push auf <code>main</code> gebaut (<code>--strict</code>) und auf GitHub Pages veröffentlicht</td></tr>
+        <tr><td class="path">examples/</td><td>Jupyter-Notebooks je Thema (Oracle, Deep Research, Sandboxes, Automationen, Continual Learning, Provider-Vergleich)</td><td>Ausführbare Tutorials</td></tr>
+        <tr><td class="path">eval/longmemeval/</td><td>Benchmark-Harness für LongMemEval (Datensatz laden, auswerten, A/B vergleichen)</td><td>Misst, ob das Gedächtnis wirklich hilft — wird sogar mit ins Wheel gepackt (<code>pyproject.toml:173–181</code>)</td></tr>
+        <tr><td class="path">apps/desktop/ · packaging/npm/ · install.sh</td><td>Tauri-Desktop-Hülle um die Web-UI, npm-Wrapper (<code>npm i -g memorizz</code> lädt <code>uv</code>), curl-Installer</td><td>Verteilungswege für Nicht-Python-Nutzer</td></tr>
+        <tr><td class="path">.github/workflows/</td><td><code>test.yml</code>, <code>docs.yml</code>, <code>publish.yml</code></td><td>CI, Doku-Deploy, Release nach PyPI bei <code>v*</code>-Tag</td></tr>
+        <tr><td class="path">scripts/ · Makefile · pyproject.toml</td><td>Prüf-/Wartungsskripte, Make-Ziele (<code>make test</code>, <code>make docs-serve</code>), Build (hatchling) und Extras (<code>[oracle]</code>, <code>[mongodb]</code>, <code>[ui]</code>, …)</td><td>Optionale Abhängigkeiten bleiben aus der Basis-Installation heraus — <code>pip install memorizz</code> lädt kein PyTorch</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>
+      <strong>Reifegrad, aus dem CHANGELOG gelesen:</strong> 0.0.5x (Juni 2026) → 0.1.0 (18. Juni) → 0.2.0 (18. Juli) →
+      0.3.0/0.4.0 (19. Juli) → 0.5.0/0.5.1 (12. August 2026). Ein junges, sehr schnell wachsendes Projekt eines
+      einzelnen Autors (Richmond Alake), 149 Commits. Für dich heißt das: Konzepte sind stabil, Details der
+      API können sich zwischen Minor-Versionen ändern — immer gegen die Version pinnen, mit der du arbeitest.
+    </p>
+
+    <div class="callout">
+      <div class="label">Merke — Kapitel 1 in fünf Sätzen</div>
+      <ol>
+        <li>LLMs vergessen alles; memorizz gibt Agenten ein Gedächtnis, das nach kognitiver Rolle getrennt ist (semantisch, prozedural, episodisch, kurzfristig, geteilt).</li>
+        <li>Drei Säulen: Memory-Systeme (was), Storage-Provider (wo/wie), Agent-Laufzeit (wer) — plus Modell-Adapter und optionale Fähigkeiten.</li>
+        <li>Die Fachlogik redet nur mit dem <code>MemoryProvider</code>-Interface; darum ist das Backend austauschbar.</li>
+        <li><code>MemoryType</code> (13 Fächer) und <code>ApplicationMode</code> (3 Voreinstellungen) sind das Vokabular; <code>user_id → agent_id → memory_id → thread_id</code> die Adressierung.</li>
+        <li>Experimentell, nicht-kommerzielle Lizenz, sehr junge Codebasis — ideal zum Lernen und Prototypen.</li>
+      </ol>
+    </div>
+
+    <div class="callout">
+      <div class="label">Kontrollfragen (beantworte sie im Chat — ich gebe Feedback)</div>
+      <ol>
+        <li>Warum trennt memorizz die Memory-Systeme (Säule A) von den Storage-Providern (Säule B)? Was ginge kaputt, wenn <code>KnowledgeBase</code> direkt MongoDB-Aufrufe enthielte?</li>
+        <li>Der <code>assistant</code>-Modus aktiviert <code>personas</code> und <code>entity_memory</code>, der <code>workflow</code>-Modus nicht — aber <code>toolbox</code>. Was sagt das über die beiden Einsatzzwecke?</li>
+        <li>Zwei Endnutzer deiner App reden mit demselben Agenten. Welche ID hält ihre Erinnerungen auseinander — und warum ist es ein Parameter von <code>run()</code> und nicht des Builders?</li>
+      </ol>
+    </div>
+
+    <div class="callout task">
+      <div class="label">Mini-Übung (5–8 Zeilen, ohne API-Key)</div>
+      <p>Datei <code>outputs/lernpfad/uebung_kapitel_1.py</code> ist vorbereitet (Import aus <code>src/</code> ist schon geregelt). Ergänze den <code>TODO</code>-Block so, dass das Skript für jeden <code>ApplicationMode</code> seine Memory-Typen ausgibt <em>und</em> am Ende die Typen nennt, die in <strong>allen drei</strong> Modi vorkommen. Ausführen aus dem Repo-Root:</p>
+      <pre><code>python outputs/lernpfad/uebung_kapitel_1.py</code></pre>
+      <p>Warum das nützlich ist: Die Schnittmenge ist die „Grundausstattung“ jedes memorizz-Agenten — sie zu kennen hilft in Kapitel 2 und 3, den Rest als Zusatz einzuordnen. Wenn du lieber nicht tippen willst: sag Bescheid, dann löse ich sie und erkläre das Ergebnis.</p>
+    </div>
+
+    <div class="next">
+      <p><strong>Nächster Schritt:</strong> Sag „weiter“ für <em>Kapitel 2 — Der Agent</em> (wir öffnen <code>memagent/core.py</code> und gehen <code>run()</code> Schritt für Schritt durch), oder stell mir zuerst Fragen zu Kapitel 1.</p>
+    </div>
+  </main>
+
+  <aside class="glossary">
+    <div class="label">Glossar</div>
+    <dl>
+      <dt>Agent</dt><dd>Programm, das ein LLM in einer Schleife mit Werkzeugen und Gedächtnis betreibt, bis eine Aufgabe erledigt ist.</dd>
+      <dt>MemAgent</dt><dd>Die zentrale Klasse von memorizz (<code>memagent/core.py</code>); koordiniert Memory, Tools und Modelle über Manager.</dd>
+      <dt>MemoryProvider</dt><dd>Abstraktes Speicher-Interface; Implementierungen: Filesystem, MongoDB, Oracle.</dd>
+      <dt>MemoryType</dt><dd>Enum der 13 Speicher-Fächer (Wissensbasis, Persona, Toolbox, Konversation, …).</dd>
+      <dt>ApplicationMode</dt><dd>Voreinstellung, welche Fächer aktiv sind: assistant, workflow, deep_research.</dd>
+      <dt>Embedding</dt><dd>Zahlenvektor, der die Bedeutung eines Textes kodiert; ähnliche Bedeutung → nahe Vektoren.</dd>
+      <dt>Vektorsuche</dt><dd>Suche nach den Vektoren mit der größten Ähnlichkeit (z. B. Kosinus) zur Anfrage.</dd>
+      <dt>Semantic Cache</dt><dd>Kurzzeit-Cache: kommt eine sehr ähnliche Frage erneut, wird die gespeicherte Antwort geliefert.</dd>
+      <dt>Kontextfenster</dt><dd>Maximale Tokenmenge, die ein LLM pro Anfrage sieht — der knappe, teure Platz.</dd>
+      <dt>Tool</dt><dd>Funktion, die das LLM aufrufen darf (Web-Suche, Code ausführen, Datei lesen …).</dd>
+      <dt>MCP</dt><dd>Model Context Protocol — Standard, um Tools/Ressourcen zwischen Hosts und Servern auszutauschen; memorizz ist Client <em>und</em> Server.</dd>
+      <dt>user_id / memory_id / thread_id</dt><dd>Mandant → Gedächtnisraum → Gesprächsfaden; Parameter von <code>run()</code>.</dd>
+    </dl>
+  </aside>
+
+</div>
+</body>
+</html>
