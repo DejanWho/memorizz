@@ -29,11 +29,22 @@ def main() -> None:
     # TODO (5–8 Zeilen):
     #   1. Für jeden Modus in `modes` die Memory-Typen ausgeben, z. B.
     #        assistant: conversation_memory, knowledge_base, ...
+
+    for mode in modes:
+        memory_types = ApplicationModeConfig.get_memory_types(mode)
+        memory_type_names = [mt.name for mt in memory_types]
+        print(f"{mode.name.lower()}: {', '.join(memory_type_names)}")
+
+
     #   2. Die Schnittmenge aller Typen bilden (Tipp: set-Intersection über die
     #      Listen aus get_memory_types) und als "Grundausstattung: ..." ausgeben.
     #   Erwartung: drei Typen sind in allen Modi enthalten. Welche — und warum
     #   ergibt das Sinn? (Kurz im Chat beantworten.)
-    raise NotImplementedError("Ergänze hier deine Lösung (siehe TODO oben).")
+    # Schnittmenge aller Typen bilden
+    all_memory_types = [set(ApplicationModeConfig.get_memory_types(mode)) for mode in modes]
+    common_memory_types = set.intersection(*all_memory_types)
+    common_memory_type_names = [mt.name for mt in common_memory_types]
+    print(f"Grundausstattung: {', '.join(common_memory_type_names)}")
 
 
 if __name__ == "__main__":
