@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memorizz"
-version = "0.5.1"
+version = "0.8.0"
 description = "A memory management library and local agent CLI for Python"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,14 +39,9 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-dotenv>=0.19.0",
     "requests>=2.31.0",
-    # First-class MCP client support (stdio, Streamable HTTP, SSE, OAuth).
-    "mcp>=2.0.0,<3.0.0",
-    # Streamable HTTP server runtime used by `memorizz mcp serve`.
-    "uvicorn>=0.24.0",
-    # Encrypt MCP bearer/OAuth credentials in the local credential store.
-    "cryptography>=42.0.0",
     # CLI front-end — tiny, pure-Python. Kept in base (not behind an extra) so
-    # `uv tool install memorizz` / `pipx install memorizz` / `npm i -g memorizz`
+    # `uv tool install --python 3.12 memorizz` / `pipx install memorizz` /
+    # `npm i -g memorizz`
     # yield a working `memorizz` REPL with no extra install flags.
     "typer>=0.12.0",
     "rich>=13.7.0",
@@ -67,6 +62,11 @@ dependencies = [
 mongodb = ["pymongo>=4.0.0"]
 oracle = ["oracledb>=2.0.0"]
 filesystem = ["faiss-cpu>=1.7.4"]
+mcp = [
+    "mcp>=2.0.0,<3.0.0",
+    "uvicorn>=0.24.0",
+    "cryptography>=42.0.0",
+]
 # CLI deps ship in base; this empty alias keeps `pip install memorizz[cli]` valid.
 cli = []
 # Fully-local stack: Ollama LLM + Ollama embeddings + FAISS filesystem memory.
@@ -95,6 +95,11 @@ docs = [
     "mkdocs-git-revision-date-localized-plugin>=1.2.0",
     "pymdown-extensions>=10.0",
 ]
+notebooks = [
+    "jupyterlab>=4.0.0",
+    "ipykernel>=6.0.0",
+    "nbconvert>=7.0.0",
+]
 sandbox-e2b = [
     # e2b 2.38 replaced the shared transport signature while the current
     # code-interpreter 2.9 client still passes its HTTP/1.1 `http2` override.
@@ -105,6 +110,22 @@ sandbox-daytona = ["daytona>=1.0"]
 sandbox = [
     "e2b>=2.26.0,<2.38.0",
     "e2b-code-interpreter>=2.9.0,<2.10.0",
+]
+terminal-bench = ["harbor>=0.21.0,<0.22.0"]
+# Benchmark adapters remain optional so production installs do not pull Docker,
+# dataset, tokenizer, or deep-learning stacks unnecessarily.
+swe-bench = [
+    "swebench>=5.0.2,<6.0.0",
+    "datasets>=3.0.0",
+    "docker>=7.0.0",
+]
+membench-eval = ["tiktoken>=0.7.0"]
+longmemeval-v2 = [
+    "transformers>=4.57.0",
+    "pillow>=10.0.0",
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "tqdm>=4.66.0",
 ]
 ui = [
     "fastapi>=0.104.0",
@@ -131,6 +152,8 @@ dev = [
     "oracledb>=2.0.0",
 ]
 all = [
+    "mcp>=2.0.0,<3.0.0",
+    "cryptography>=42.0.0",
     "anthropic>=0.26.0",
     "pymongo>=4.0.0",
     "oracledb>=2.0.0",
@@ -167,6 +190,12 @@ Issues = "https://github.com/RichmondAlake/memorizz/issues"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.targets.wheel]
+# Hatchling 1.32 defaults to Core Metadata 2.5, which the current stable
+# Twine release does not yet validate. Keep release artifacts on the broadly
+# supported 2.4 format until the upload toolchain has end-to-end 2.5 support.
+core-metadata-version = "2.4"
+
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
 
@@ -177,14 +206,56 @@ allow-direct-references = true
 # searches the package dir, so discovery works unchanged.
 "eval/longmemeval/evaluate_memorizz.py" = "memorizz/eval/longmemeval/evaluate_memorizz.py"
 "eval/longmemeval/download_dataset.py" = "memorizz/eval/longmemeval/download_dataset.py"
+"eval/longmemeval_v2/evaluate_memorizz.py" = "memorizz/eval/longmemeval_v2/evaluate_memorizz.py"
+"eval/longmemeval_v2/README.md" = "memorizz/eval/longmemeval_v2/README.md"
+"eval/swe_bench_lite/evaluate_memorizz.py" = "memorizz/eval/swe_bench_lite/evaluate_memorizz.py"
+"eval/swe_bench_lite/README.md" = "memorizz/eval/swe_bench_lite/README.md"
+"eval/membench/evaluate_memorizz.py" = "memorizz/eval/membench/evaluate_memorizz.py"
+"eval/membench/README.md" = "memorizz/eval/membench/README.md"
+"eval/memory_suite/evaluate_memorizz.py" = "memorizz/eval/memory_suite/evaluate_memorizz.py"
+"eval/memory_suite/README.md" = "memorizz/eval/memory_suite/README.md"
 "src/memorizz/py.typed" = "memorizz/py.typed"
 "src/memorizz/sandbox/MemorizzGraalSandbox.java" = "memorizz/sandbox/MemorizzGraalSandbox.java"
 
 [tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
 exclude = [
+    # A source archive may be built from a developer checkout rather than a
+    # pristine CI clone. Exclude local-only plans, credentials, and generated
+    # desktop output explicitly instead of relying solely on Git ignore rules.
+    "**/*.local.md",
+    ".env",
+    ".env.*",
+    "**/.env",
+    "**/.env.*",
+    "**/secrets.json",
+    "**/credentials.json",
+    "**/*.key",
+    "**/*.pem",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.secret",
+    ".claude/**",
+    ".venv/**",
+    "apps/**/dist/**",
+    "apps/**/node_modules/**",
+    "apps/**/src-tauri/gen/**",
+    "apps/**/src-tauri/target/**",
+    "dist/**",
+    "research/**",
+    # Audit reports are kept outside the repository and release artifacts.
+    "reports/**",
+    "docs/releases/**",
+    "docs/**/*report*.md",
     "temp_unpack*",
+    "eval/datasets/**",
     "eval/longmemeval/data/**",
     "eval/longmemeval/results/**",
+    "eval/longmemeval_v2/results/**",
+    "eval/swe_bench_lite/results/**",
+    "eval/membench/results/**",
+    "eval/memory_suite/results/**",
+    "eval/results/**",
     "longmemeval_evaluation.log",
     "matrix_results*.txt",
     "scenario/**",

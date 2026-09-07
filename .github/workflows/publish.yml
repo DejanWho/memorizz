@@ -30,7 +30,7 @@ jobs:
           python-version: "3.11"
       # UI routes are part of the release suite; provider SDKs are included by
       # the dev extra so Oracle/MongoDB/Anthropic tests do not silently skip.
-      - run: pip install -e ".[dev,ui]"
+      - run: pip install -e ".[dev,ui,mcp]"
       # Match test.yml: tests/performance is excluded — it's flaky on shared
       # CI runners, and a release gate must not be flakier than CI.
       - run: pytest tests/unit tests/integration -q
@@ -52,7 +52,47 @@ jobs:
       - name: Build sdist + wheel
         run: uv build
       - name: Check artifacts
-        run: uvx twine check dist/*
+        run: |
+          uvx twine check dist/*
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import tarfile
+
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          blocked_names = {".env", "secrets.json", "credentials.json"}
+          blocked_suffixes = (
+              ".local.md", ".key", ".pem", ".p12", ".pfx", ".secret"
+          )
+          blocked_roots = {".venv", "dist", "reports", "research", "site"}
+          blocked_segments = {
+              ("docs", "releases"),
+              ("eval", "datasets"),
+              ("src-tauri", "gen"),
+              ("src-tauri", "target"),
+          }
+
+          def is_blocked(name):
+              parts = PurePosixPath(name).parts[1:]  # strip versioned root
+              if not parts:
+                  return False
+              basename = parts[-1]
+              pairs = set(zip(parts, parts[1:]))
+              return (
+                  parts[0] in blocked_roots
+                  or "node_modules" in parts
+                  or basename in blocked_names
+                  or basename.startswith(".env.")
+                  or basename.endswith(blocked_suffixes)
+                  or ("docs" in parts and "report" in basename and basename.endswith(".md"))
+                  or bool(pairs & blocked_segments)
+              )
+
+          with tarfile.open(sdist, "r:gz") as archive:
+              blocked = [m.name for m in archive.getmembers() if is_blocked(m.name)]
+          if blocked:
+              raise SystemExit(f"Blocked local/generated files in sdist: {blocked}")
+          print("sdist content policy: OK")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -86,12 +126,27 @@ jobs:
           assert has('memorizz') and has('ollama'), 'default zero-config stack deps missing from base'
           leaked = [m for m in ['langchain_ollama', 'torch', 'transformers', 'faiss'] if has(m)]
           assert not leaked, f'heavy deps leaked into base install: {leaked}'
+          optional = [m for m in ['mcp', 'cryptography', 'uvicorn'] if has(m)]
+          assert not optional, f'optional MCP dependencies leaked into base: {optional}'
           import memorizz; print('clean-room OK:', memorizz.__version__)
           "
       - name: CLI entrypoints work without a daemon
         run: |
           /tmp/clean/bin/memorizz --version
           /tmp/clean/bin/memorizz --help >/dev/null
+      - name: MCP extra closes the optional dependency set
+        run: |
+          python -m venv /tmp/mcp
+          /tmp/mcp/bin/python -m pip install --quiet --upgrade pip
+          WHEEL_PATH=$(find "$PWD/dist" -name '*.whl' -print -quit)
+          /tmp/mcp/bin/python -m pip install --quiet "${WHEEL_PATH}[mcp]"
+          /tmp/mcp/bin/python -c "
+          import memorizz
+          report = memorizz.capabilities()
+          assert report['features']['mcp_client']['available'], report
+          assert report['features']['mcp_server']['available'], report
+          print('mcp extra OK:', memorizz.__version__)
+          "
 
   pypi:
     needs: smoke
@@ -186,15 +241,29 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
+      - name: Extract curated release notes
+        run: |
+          VER="${RELEASE_TAG#v}"
+          awk -v version="$VER" '
+            $0 ~ "^## " version " " { emitting=1; next }
+            /^## / && emitting { exit }
+            emitting { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          name: MemoRizz ${{ env.RELEASE_TAG }}
+          body_path: release-notes.md
           files: dist/*
-          generate_release_notes: true
+          fail_on_unmatched_files: true
 
   npm:
     needs: pypi
@@ -222,6 +291,10 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      - name: Test npm launcher
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: packaging/npm
+        run: node test/launcher.test.js
       - name: Sync version + publish shim
         if: steps.gate.outputs.enabled == 'true'
         working-directory: packaging/npm
@@ -271,19 +344,20 @@ jobs:
           done
           test -n "$URL"
           curl -fsSL "$URL" -o sdist.tar.gz
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "sha256=$(sha256sum sdist.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Bump formula in tap
         if: steps.gate.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
           VER: ${{ steps.meta.outputs.version }}
+          URL: ${{ steps.meta.outputs.url }}
           SHA: ${{ steps.meta.outputs.sha256 }}
         run: |
           git clone "https://x-access-token:${GH_TOKEN}@github.com/RichmondAlake/homebrew-memorizz.git" tap
           F=tap/Formula/memorizz.rb
-          sed -i -E "s|memorizz-[0-9.]+\.tar\.gz|memorizz-${VER}.tar.gz|" "$F"
-          sed -i -E "s|sha256 \"[a-f0-9]*\"|sha256 \"${SHA}\"|" "$F"
-          sed -i -E "s|version \"[0-9.]+\"|version \"${VER}\"|" "$F"
+          sed -i -E "s|^  url \".*memorizz-[0-9.]+\.tar\.gz\"|  url \"${URL}\"|" "$F"
+          sed -i -E "s|^  sha256 \"[a-f0-9]*\"|  sha256 \"${SHA}\"|" "$F"
           cd tap
           git config user.name "github-actions"
           git config user.email "actions@github.com"

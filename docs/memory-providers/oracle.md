@@ -190,21 +190,35 @@ Oracle persists the same production metadata as the document providers:
   provenance, tags, and invalidation metadata;
 - workflow, skill, shared-memory, tool-log, and first-party MCP data required by
   the 0.5 runtime.
+- immutable learning events, compiler checkpoints, compiled artifacts, and
+  reversible forgetting tombstones as logical records in private shared
+  memory; `list_all(shared_memory)` returns the complete typed projection.
 
 Summary creation and original-message marking are transactional. Retrieval by
 `summary_id` and `expand_summary()` reconstruct the linked source messages.
 
 ## Upgrade an existing schema
 
-Back up first, then apply the migrations in numeric order. The 0.5 migration
-is:
+Back up first, then apply every migration that has not yet been applied to the
+schema, in numeric order. The packaged migrations are:
 
 ```text
+src/memorizz/memory_provider/oracle/migrations/001_add_user_id.sql
+src/memorizz/memory_provider/oracle/migrations/002_add_skill_injection_role.sql
+src/memorizz/memory_provider/oracle/migrations/003_add_shadow_evaluations.sql
 src/memorizz/memory_provider/oracle/migrations/004_production_governance_050.sql
+src/memorizz/memory_provider/oracle/migrations/005_scoped_retrieval_052.sql
+src/memorizz/memory_provider/oracle/migrations/006_knowledge_base_provenance.sql
+src/memorizz/memory_provider/oracle/migrations/007_structured_tool_outcomes.sql
 ```
 
-The provider performs additive startup checks for availability, but the SQL
-file is the recommended review/change-control artifact.
+Migration 005 adds/backfills exact summary thread scope and restores indexed
+knowledge-base namespace metadata on older schemas. Migration 006 preserves
+source provenance for grounded knowledge records. Migration 007 adds structured
+`outcome` and `outcome_details` fields to tool logs and backfills legacy rows;
+it is idempotent and can be rerun safely. The provider performs additive startup
+checks for availability, but the SQL files are the recommended review and
+change-control artifacts.
 
 ## Scoped cleanup
 
@@ -251,3 +265,12 @@ authorized DBA increase vector memory and restart the database.
 
 **Missing summary/cache fields:** apply migration 004, then restart the
 provider and rerun preflight/tests.
+
+**Missing knowledge provenance fields:** apply migration 006. It adds
+`source_id`, `parent_source_id`, `linked_source_ids`, and `metadata` to
+`knowledge_base` so the same grounded evidence contract survives Filesystem,
+MongoDB, and Oracle round trips.
+
+**Missing structured tool outcomes:** apply migration 007, then restart the
+provider. It adds `outcome` and `outcome_details` to `tool_log` and maps legacy
+success/failure rows to `success`/`error` without changing their payloads.

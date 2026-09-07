@@ -128,6 +128,15 @@ class MemoryManager:
             return content.get("user_id")
         return None
 
+    @staticmethod
+    def _entry_memory_id(entry: Any) -> str:
+        """Read the owning memory id from flat and nested provider rows."""
+        if not isinstance(entry, dict):
+            return ""
+        content = entry.get("content")
+        nested = content if isinstance(content, dict) else {}
+        return str(entry.get("memory_id") or nested.get("memory_id") or "")
+
     def load_conversation_history(
         self,
         memory_id: str,
@@ -313,6 +322,8 @@ class MemoryManager:
         limit: int = 5,
         user_id: Optional[str] = None,
         include_embedding: bool = False,
+        thread_id: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories relevant to a query.
@@ -327,6 +338,8 @@ class MemoryManager:
             include_embedding: When True (and the provider supports it),
                 results carry their stored embedding vectors so callers can
                 run similarity dedup/MMR without re-embedding anything.
+            thread_id: Optional exact thread boundary for episodic recall.
+            namespace: Optional exact namespace boundary for knowledge recall.
 
         Returns:
             List of relevant memory entries. Always a list — providers that
@@ -341,6 +354,10 @@ class MemoryManager:
                 "limit": limit,
                 "user_id": user_id,
             }
+            if thread_id is not None:
+                kwargs["thread_id"] = str(thread_id)
+            if namespace is not None:
+                kwargs["namespace"] = str(namespace)
             # Only forward include_embedding to providers that understand it;
             # older/third-party providers keep their default projection.
             if include_embedding and _callable_accepts(
@@ -361,7 +378,50 @@ class MemoryManager:
                     results = list(results)
                 except TypeError:
                     # Single dict from "find_one"-style helpers.
-                    results = [results] if results else []
+                    # Any other non-iterable value violates the provider
+                    # contract and must degrade to no evidence. Treating a
+                    # truthy sentinel (for example a client mock) as a memory
+                    # row leaks arbitrary attributes into provenance fields.
+                    results = [results] if isinstance(results, dict) else []
+
+            # ``**kwargs`` support does not prove that a third-party provider
+            # applied those filters.  Semantic recall is a prompt-injection
+            # boundary, so enforce the authenticated memory and user scope a
+            # second time before any row can reach the model.
+            wanted_memory_id = str(memory_id or "")
+            results = [
+                row
+                for row in results
+                if isinstance(row, dict)
+                and self._entry_memory_id(row) == wanted_memory_id
+                and self._entry_user_id(row) == user_id
+            ]
+
+            # Providers may accept **kwargs yet not push every scope into their
+            # native query. Enforce exact boundaries again in the manager so a
+            # third-party backend cannot silently broaden automatic recall.
+            if thread_id is not None:
+                wanted_thread = str(thread_id)
+                results = [
+                    row
+                    for row in results
+                    if isinstance(row, dict)
+                    and self._entry_thread_id(row) == wanted_thread
+                ]
+            if namespace is not None:
+                wanted_namespace = str(namespace)
+
+                def _entry_namespace(row: Dict[str, Any]) -> str:
+                    content = row.get("content")
+                    nested = content if isinstance(content, dict) else {}
+                    return str(row.get("namespace") or nested.get("namespace") or "")
+
+                results = [
+                    row
+                    for row in results
+                    if isinstance(row, dict)
+                    and _entry_namespace(row) == wanted_namespace
+                ]
 
             logger.debug(
                 f"Retrieved {len(results)} relevant memories for query: {query[:50]}..."
@@ -547,6 +607,8 @@ class MemoryManager:
         tool_call_id: Optional[str] = None,
         success: bool = True,
         error: Optional[str] = None,
+        outcome: Optional[str] = None,
+        outcome_details: Optional[Dict[str, Any]] = None,
         thread_id: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> Optional[str]:
@@ -566,6 +628,10 @@ class MemoryManager:
             tool_call_id: Optional tool call ID from the LLM.
             success: Whether the tool executed successfully.
             error: Error message if the tool failed.
+            outcome: Structured terminal outcome such as ``fallback`` or
+                ``provider_error``.
+            outcome_details: Content-free provider, reason, and result-count
+                metadata for the structured outcome.
             thread_id: Optional thread ID.
 
         Returns:
@@ -597,6 +663,8 @@ class MemoryManager:
                 "result": result_str,
                 "success": success,
                 "error": error,
+                "outcome": outcome or ("success" if success else "error"),
+                "outcome_details": dict(outcome_details or {}),
                 "timestamp": timestamp.isoformat(),
                 "agent_id": agent_id,
                 "tool_call_id": tool_call_id or "",
@@ -722,6 +790,7 @@ class MemoryManager:
         agent_id: Optional[str] = None,
         limit: int = 10,
         user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Load existing summary documents for a given thread.
@@ -738,7 +807,12 @@ class MemoryManager:
             # filtering in Python. Fallback keeps third-party providers
             # working unchanged.
             native = getattr(self.memory_provider, "list_summaries", None)
-            if callable(native):
+            native_is_exact = (
+                callable(native)
+                and _callable_accepts(native, "user_id")
+                and (thread_id is None or _callable_accepts(native, "thread_id"))
+            )
+            if native_is_exact:
                 kwargs: Dict[str, Any] = {
                     "memory_id": memory_id,
                     "agent_id": agent_id,
@@ -746,6 +820,8 @@ class MemoryManager:
                 }
                 if _callable_accepts(native, "user_id"):
                     kwargs["user_id"] = user_id
+                if thread_id is not None and _callable_accepts(native, "thread_id"):
+                    kwargs["thread_id"] = str(thread_id)
                 documents = native(**kwargs) or []
             else:
                 documents = self.memory_provider.list_all(MemoryType.SUMMARIES) or []
@@ -771,6 +847,10 @@ class MemoryManager:
                 doc.get("memory_id") or doc.get("memoryId") or ""
             ).strip()
             doc_agent_id = str(doc.get("agent_id") or doc.get("agentId") or "").strip()
+            doc_thread_id = self._entry_thread_id(doc)
+
+            if thread_id is not None and doc_thread_id != str(thread_id):
+                continue
 
             # Match by memory_id or agent_id
             if normalized_memory_id and doc_memory_id != normalized_memory_id:
@@ -800,6 +880,7 @@ class MemoryManager:
                     "memory_units_count": units_count,
                     "source_message_ids": message_ids,
                     "memory_id": doc_memory_id,
+                    "thread_id": doc_thread_id or None,
                 }
             )
 
@@ -818,6 +899,7 @@ class MemoryManager:
         self,
         message_ids: List[str],
         user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve specific conversation messages by their IDs.
@@ -833,6 +915,10 @@ class MemoryManager:
                 if doc and isinstance(doc, dict):
                     if doc.get("user_id") != user_id:
                         # Tenant isolation: skip rows belonging to another user.
+                        continue
+                    if thread_id is not None and self._entry_thread_id(doc) != str(
+                        thread_id
+                    ):
                         continue
                     results.append(doc)
             except Exception as exc:
@@ -876,6 +962,7 @@ class MemoryManager:
         memory_id: str,
         limit: int = 200,
         user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Get conversation messages that have NOT been summarized yet.
@@ -884,7 +971,10 @@ class MemoryManager:
         """
         try:
             history = self.load_conversation_history(
-                memory_id, limit=limit, user_id=user_id
+                memory_id,
+                limit=limit,
+                user_id=user_id,
+                thread_id=thread_id,
             )
             unsummarized = []
             for item in history:
@@ -1014,12 +1104,7 @@ class MemoryManager:
                         and memory.get("user_id") == user_id
                         and (
                             thread_id is None
-                            or str(
-                                memory.get("thread_id")
-                                or memory.get("conversation_id")
-                                or ""
-                            )
-                            == str(thread_id)
+                            or self._entry_thread_id(memory) == str(thread_id)
                         )
                     ]
 
@@ -1120,7 +1205,7 @@ class MemoryManager:
             for memory in all_memories:
                 key = (
                     memory.get("memory_id"),
-                    memory.get("thread_id"),
+                    self._entry_thread_id(memory),
                     memory.get("user_id"),
                 )
                 grouped.setdefault(key, []).append(memory)
@@ -1168,6 +1253,7 @@ class MemoryManager:
                         "memory_id": chunk_memory_id,
                         "agent_id": agent_id,
                         "user_id": memory_chunk[0].get("user_id"),
+                        "thread_id": self._entry_thread_id(memory_chunk[0]) or None,
                         "content": summary_content,
                         "period_start": period_start,
                         "period_end": period_end,

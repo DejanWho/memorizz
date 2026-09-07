@@ -22,10 +22,11 @@ from tests.mocks.mock_providers import MockMemoryProvider
 
 
 class _Cursor:
-    def __init__(self, *, update_rowcounts=None):
+    def __init__(self, *, update_rowcounts=None, fetchone_value=None):
         self.calls = []
         self.rowcount = 0
         self._update_rowcounts = iter(update_rowcounts or [])
+        self._fetchone_value = fetchone_value
 
     def execute(self, sql, params=None):
         self.calls.append((" ".join(str(sql).split()), dict(params or {})))
@@ -35,7 +36,7 @@ class _Cursor:
             self.rowcount = 1
 
     def fetchone(self):
-        return None
+        return self._fetchone_value
 
 
 class _Connection:
@@ -75,6 +76,26 @@ def _bare_provider(connection):
 
 
 @pytest.mark.unit
+def test_oracle_knowledge_base_honors_store_memory_id_argument():
+    provider = OracleProvider.__new__(OracleProvider)
+    captured = {}
+
+    def store_knowledge_base(data):
+        captured.update(data)
+        return "row-1"
+
+    provider._store_knowledge_base = store_knowledge_base
+    result = provider.store(
+        {"content": "Scoped policy", "user_id": "alice"},
+        MemoryType.KNOWLEDGE_BASE,
+        memory_id="memory-argument",
+    )
+
+    assert result == "row-1"
+    assert captured["memory_id"] == "memory-argument"
+
+
+@pytest.mark.unit
 def test_oracle_summary_schema_and_by_id_projection_are_complete():
     oracle_root = (
         Path(__file__).parents[2] / "src" / "memorizz" / "memory_provider" / "oracle"
@@ -105,6 +126,26 @@ def test_oracle_summary_schema_and_by_id_projection_are_complete():
     }.issubset(fields)
     tool_log_fields = {field.col for field in _BY_ID_SPECS[MemoryType.TOOL_LOG][1]}
     assert "user_id" in tool_log_fields
+    assert {"outcome", "outcome_details"}.issubset(tool_log_fields)
+
+
+@pytest.mark.unit
+def test_oracle_tool_outcome_migration_is_rerunnable_and_backfills_legacy_rows():
+    migration = (
+        Path(__file__).parents[2]
+        / "src"
+        / "memorizz"
+        / "memory_provider"
+        / "oracle"
+        / "migrations"
+        / "007_structured_tool_outcomes.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "user_tab_columns" in migration
+    assert "add_column_if_missing" in migration
+    assert "'tool_log', 'outcome'" in migration
+    assert "'tool_log', 'outcome_details'" in migration
+    assert "CASE WHEN success = 1 THEN 'success' ELSE 'error' END" in migration
 
 
 @pytest.mark.unit
@@ -136,6 +177,23 @@ def test_oracle_record_memory_types_have_raw_by_id_projections(memory_type):
     assert {"id", "memory_id", "content", "user_id"}.issubset(
         {field.col for field in fields}
     )
+
+
+@pytest.mark.unit
+def test_oracle_shared_memory_has_a_complete_list_projection():
+    fields, order_by = _LIST_SPECS[MemoryType.SHARED_MEMORY]
+    assert {
+        "id",
+        "memory_id",
+        "content",
+        "memory_type",
+        "scope",
+        "owner_agent_id",
+        "access_list",
+        "created_at",
+        "updated_at",
+    }.issubset({field.col for field in fields})
+    assert order_by == "created_at"
 
 
 @pytest.mark.unit
@@ -173,6 +231,118 @@ def test_oracle_record_store_returns_physical_row_id(memory_type, store_method):
     assert captured["memory_store_type"] == memory_type
     assert captured["required_columns"]["id"] == uuid.UUID(record_id).bytes
     assert result != "shared-group-id"
+
+
+@pytest.mark.unit
+def test_oracle_knowledge_base_preserves_source_provenance():
+    provider = OracleProvider.__new__(OracleProvider)
+    provider._generate_embedding_if_needed = lambda *args, **kwargs: None
+    captured = {}
+    provider._insert_base_row = lambda *args, **kwargs: captured.update(kwargs)
+
+    provider._store_knowledge_base(
+        {
+            "memory_id": "evaluation",
+            "content": "A source-linked semantic event",
+            "source_id": "derived",
+            "parent_source_id": "cue:1",
+            "linked_source_ids": ["cue:1", "cue:2"],
+            "metadata": {"event_time": "2026-08-23T12:00:00"},
+        }
+    )
+
+    optional = captured["optional_columns"]
+    assert optional["source_id"] == "derived"
+    assert optional["parent_source_id"] == "cue:1"
+    assert json.loads(optional["linked_source_ids"]) == ["cue:1", "cue:2"]
+    assert json.loads(optional["metadata"])["event_time"].startswith("2026-08-23")
+
+    fields = {field.col for field in _VECTOR_SPECS[MemoryType.KNOWLEDGE_BASE]}
+    assert {"source_id", "parent_source_id", "linked_source_ids", "metadata"}.issubset(
+        fields
+    )
+
+
+@pytest.mark.unit
+def test_oracle_entity_upsert_rejects_cross_tenant_entity_id():
+    cursor = _Cursor(fetchone_value=("shared-memory", "user-b"))
+    connection = _Connection(cursor)
+    provider = _bare_provider(connection)
+    provider._memory_type_has_column = lambda *_args: True
+
+    with pytest.raises(PermissionError, match="ownership mismatch"):
+        provider._store_entity_memory(
+            {
+                "entity_id": "entity-shared-id",
+                "name": "user",
+                "memory_id": "shared-memory",
+                "user_id": "user-a",
+            }
+        )
+
+    assert len(cursor.calls) == 1
+    assert "FOR UPDATE" in cursor.calls[0][0]
+    assert connection.commits == 0
+
+
+@pytest.mark.unit
+def test_oracle_entity_upsert_allows_existing_owner_scope():
+    cursor = _Cursor(fetchone_value=("shared-memory", "user-a"))
+    connection = _Connection(cursor)
+    provider = _bare_provider(connection)
+    provider._memory_type_has_column = lambda *_args: True
+
+    entity_id = provider._store_entity_memory(
+        {
+            "entity_id": "entity-shared-id",
+            "name": "user",
+            "memory_id": "shared-memory",
+            "user_id": "user-a",
+        }
+    )
+
+    assert entity_id == "entity-shared-id"
+    assert len(cursor.calls) == 2
+    assert "MERGE INTO MEMORIZZ.entity_memory" in cursor.calls[1][0]
+    assert connection.commits == 1
+
+
+@pytest.mark.unit
+def test_oracle_entity_upsert_recovers_same_scope_concurrent_insert():
+    class ConcurrentCursor(_Cursor):
+        def __init__(self):
+            super().__init__()
+            self._scopes = iter([None, ("shared-memory", "user-a")])
+            self._merge_count = 0
+
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "MERGE INTO" in str(sql).upper():
+                self._merge_count += 1
+                if self._merge_count == 1:
+                    raise RuntimeError("ORA-00001: unique constraint violated")
+
+        def fetchone(self):
+            return next(self._scopes)
+
+    cursor = ConcurrentCursor()
+    connection = _Connection(cursor)
+    provider = _bare_provider(connection)
+    provider._memory_type_has_column = lambda *_args: True
+
+    entity_id = provider._store_entity_memory(
+        {
+            "entity_id": "entity-shared-id",
+            "name": "user",
+            "memory_id": "shared-memory",
+            "user_id": "user-a",
+        }
+    )
+
+    assert entity_id == "entity-shared-id"
+    assert ["FOR UPDATE" in sql for sql, _params in cursor.calls].count(True) == 2
+    assert ["MERGE INTO" in sql for sql, _params in cursor.calls].count(True) == 2
+    assert connection.commits == 1
 
 
 @pytest.mark.unit

@@ -9,12 +9,14 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,16 +41,28 @@ from ..approval import (
     ApprovalStore,
     default_approval_store,
 )
+from ..completion import (
+    CompletionCandidate,
+    CompletionDecision,
+    CompletionPolicy,
+    CompletionRejectedError,
+)
 from ..conversation_history import is_trace_bundle_entry
 from ..enums import ApplicationMode, ApplicationModeConfig, MemoryType, Role
 from ..internet_access import get_default_internet_access_provider
 from ..llms.llm_factory import create_llm_provider
+from ..long_term.semantic.entity_memory import EntityAttributeInput, EntityRelationInput
+from ..streaming import StreamCancelled, check_cancelled, session_for
 from ..task_decomposition import normalize_delegation_config
 from ..tooling import (
     ContextPolicy,
     SemanticToolRouter,
+    ToolOutcome,
+    ToolOutcomeStatus,
+    ToolResult,
     ToolResultPolicy,
     governed_tool,
+    normalize_tool_result,
     serialize_tool_result,
     tool_metadata_to_openai,
 )
@@ -106,10 +120,75 @@ _PROMPT_BUFFER_TOKENS = 200
 # across turns — the precondition for OpenAI/Anthropic prompt-cache hits.
 # A once-per-N-turns full-price request beats a cache miss on every turn.
 _HISTORY_EVICTION_CHUNK = 20
-# Pre-inference retrieval: candidates fetched per memory source before the
-# dedup/MMR pass, and the max deduped memories injected per turn.
-_RETRIEVAL_CANDIDATE_LIMIT = 5
-_RETRIEVED_MEMORIES_MAX = 4
+# Host applications may attach content-free routing/grounding provenance to a
+# run. Only this allowlist is persisted: arbitrary application dictionaries are
+# deliberately rejected so observability cannot become a shadow prompt/content
+# store. Values are bounded again when the trace bundle is compacted.
+_OBSERVABILITY_CONTEXT_FIELDS = frozenset(
+    {
+        "request_id",
+        "client_page_type",
+        "client_page_id",
+        "client_title_fingerprint",
+        "canonical_page_type",
+        "canonical_page_id",
+        "canonical_title_fingerprint",
+        "thread_binding_status",
+        "expected_thread_id",
+        "ownership_verified",
+        "request_context_present",
+        "content_version",
+        "grounding_status",
+        "grounding_source",
+        "grounding_excerpt_count",
+        "grounding_source_ids",
+    }
+)
+
+
+_CONTEXT_LOCAL_MISSING = object()
+
+
+class _ContextLocal:
+    """Descriptor storing one value per thread/async context and agent.
+
+    MemAgent instances are commonly registered as application singletons. A
+    plain instance attribute therefore becomes a cross-request race under
+    threaded or async servers. This descriptor preserves the existing private
+    attribute API while isolating its value with ``ContextVar``.
+    """
+
+    def __init__(self, factory: Optional[Callable[[], Any]] = None):
+        self.factory = factory or (lambda: None)
+        self.name = ""
+        self.storage_name = ""
+
+    def __set_name__(self, owner: Any, name: str) -> None:
+        self.name = name
+        self.storage_name = f"__context_local_{name}"
+
+    def _var(self, instance: Any) -> ContextVar:
+        variable = instance.__dict__.get(self.storage_name)
+        if variable is None:
+            variable = ContextVar(
+                f"memorizz_{id(instance)}_{self.name}",
+                default=_CONTEXT_LOCAL_MISSING,
+            )
+            instance.__dict__[self.storage_name] = variable
+        return variable
+
+    def __get__(self, instance: Any, owner: Any = None) -> Any:
+        if instance is None:
+            return self
+        variable = self._var(instance)
+        value = variable.get()
+        if value is _CONTEXT_LOCAL_MISSING:
+            value = self.factory()
+            variable.set(value)
+        return value
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        self._var(instance).set(value)
 
 
 def _provider_error_details(exc: Exception) -> Tuple[bool, bool, Optional[int]]:
@@ -149,10 +228,33 @@ def _provider_error_details(exc: Exception) -> Tuple[bool, bool, Optional[int]]:
 
 
 class MemAgent:
-    """
-    MemAgent class that orchestrates manager components.
+    """MemAgent class that orchestrates manager components."""
 
-    """
+    _current_thread_id = _ContextLocal()
+    _current_memory_id = _ContextLocal()
+    _current_user_id = _ContextLocal()
+    _current_run_id = _ContextLocal()
+    _current_turn_id = _ContextLocal()
+    _current_root_trace_id = _ContextLocal()
+    _current_parent_span_id = _ContextLocal()
+    _last_trace_context = _ContextLocal(dict)
+    _last_tool_outcomes = _ContextLocal(list)
+    _last_retrieved_memories = _ContextLocal(list)
+    _last_retrieval_stats = _ContextLocal(dict)
+    _last_selection_ledger = _ContextLocal(list)
+    _last_memory_context_evidence = _ContextLocal(dict)
+    _last_memory_attribution_context = _ContextLocal()
+    _thread_ids_by_memory = _ContextLocal(dict)
+    _stream_event_callback = _ContextLocal()
+    _stream_trace_events = _ContextLocal()
+    _turn_had_side_effects = _ContextLocal(lambda: False)
+    _turn_had_nondeterministic_tools = _ContextLocal(lambda: False)
+    _turn_cache_domains = _ContextLocal(set)
+    _cache_bypass_reason = _ContextLocal()
+    _activated_skill_ids = _ContextLocal(list)
+    _approval_execution_active = _ContextLocal(lambda: False)
+    _last_context_window_stats = _ContextLocal()
+    _last_completion_decisions = _ContextLocal(list)
 
     def __init__(
         self,
@@ -184,6 +286,10 @@ class MemAgent:
         browser_control: Optional[
             Union[str, Dict[str, Any], "BrowserControlProvider"]
         ] = None,
+        meta_harness: Optional[Any] = None,
+        meta_harness_mode: Optional[str] = None,
+        default_harness: str = "auto",
+        harness_config: Optional[Dict[str, Any]] = None,
         skill_paths: Optional[List[str]] = None,
         mcp_servers: Optional[List[Dict[str, Any]]] = None,
         automations_enabled: bool = True,
@@ -192,6 +298,7 @@ class MemAgent:
         self_aware_config: Optional[Dict[str, Any]] = None,
         continual_learning: bool = False,
         continual_learning_config: Optional[Dict[str, Any]] = None,
+        learning_control_plane: Optional[Union[bool, Dict[str, Any], Any]] = None,
         workflow_outcome_evaluator: Optional[Callable[[Any], Any]] = None,
         toolbox: Optional[Any] = None,
         skillbox: Optional[Any] = None,
@@ -200,23 +307,79 @@ class MemAgent:
         skill_retrieval_config: Optional[Dict[str, Any]] = None,
         tool_result_policy: Optional[Union[ToolResultPolicy, Dict[str, Any]]] = None,
         context_policy: Optional[Union[ContextPolicy, Dict[str, Any]]] = None,
+        completion_policy: Optional[
+            Union[CompletionPolicy, Dict[str, Any], bool]
+        ] = None,
+        retrieval_policy: Optional[Union[Any, Dict[str, Any], str, bool]] = None,
         approval_store: Optional[ApprovalStore] = None,
         delegation: Optional[Dict[str, Any]] = None,
         semantic_layer: Optional[Any] = None,
         name: Optional[str] = None,
+        application_id: Optional[str] = None,
+        auto_register: bool = True,
         is_favorite: bool = False,
-        streaming: bool = False,
+        streaming: bool = True,
     ):
         """Initialize the MemAgent with configuration."""
         self.streaming = streaming
         self.environment_reports: Dict[str, Any] = {}
         self._last_close_report: Optional[Dict[str, Any]] = None
+        self.meta_harness = None
+        self.meta_harness_mode = (
+            str(meta_harness_mode).strip().lower() if meta_harness_mode else None
+        )
+        if self.meta_harness_mode not in {None, "delegate", "runtime"}:
+            raise ValueError("meta_harness_mode must be delegate, runtime, or None")
+        self.default_harness = (
+            str(default_harness or "auto").strip().lower().replace("_", "-")
+        )
+        self.harness_config = dict(harness_config or {})
+        self._owns_meta_harness = False
+        self._meta_harness_tools_registered = False
         # Store configuration
-        self.agent_id = agent_id or str(uuid.uuid4())
         self.name = name.strip() if isinstance(name, str) and name.strip() else None
+        configured_application_id = application_id or os.getenv(
+            "MEMORIZZ_APPLICATION_ID", ""
+        )
+        self.application_id = (
+            configured_application_id.strip()
+            if isinstance(configured_application_id, str)
+            and configured_application_id.strip()
+            else None
+        )
+        # Explicit IDs always win. For named/application-scoped agents, derive
+        # a UUID5 so a process restart cannot fragment traces into a new agent.
+        # Anonymous unnamed agents retain the historical random-ID behavior.
+        if agent_id:
+            self.agent_id = str(agent_id)
+        elif self.name or self.application_id:
+            identity = f"{self.application_id or 'default'}:{self.name or 'agent'}"
+            self.agent_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"memorizz:{identity}"))
+        else:
+            self.agent_id = str(uuid.uuid4())
+        self.auto_register = bool(auto_register)
+        self._registration_lock = threading.Lock()
+        self._registered_memory_ids: Set[str] = set()
+        self._registration_attempted = False
         self.is_favorite = bool(is_favorite)
         self.instruction = instruction or DEFAULT_INSTRUCTION
         self.max_steps = max_steps
+        self.tool_access = str(tool_access or DEFAULT_TOOL_ACCESS).strip().lower()
+        if self.tool_access not in {"private", "public", "global"}:
+            raise ValueError("tool_access must be private, public, or global")
+        # MemoRizz is memory-first by default. A bare MemAgent gets a durable,
+        # zero-configuration filesystem provider; callers that intentionally
+        # need a stateless agent can opt out explicitly with
+        # ``memory_provider=False`` (an explicit empty ``memory_types=[]`` only
+        # disables active memory systems, not agent/config persistence).
+        self.uses_default_memory_provider = memory_provider is None
+        if memory_provider is None:
+            from ..memory_provider import create_default_memory_provider
+
+            memory_provider = create_default_memory_provider()
+        elif memory_provider is False:
+            memory_provider = None
+            self.uses_default_memory_provider = False
         self.memory_provider = memory_provider
         self.memory_ids = (
             memory_ids
@@ -236,6 +399,10 @@ class MemAgent:
         self.skill_retrieval = bool(skill_retrieval)
         self.skill_retrieval_config = dict(skill_retrieval_config or {})
         self.context_policy = ContextPolicy.from_value(context_policy)
+        self.completion_policy = CompletionPolicy.from_value(completion_policy)
+        from ..retrieval import RetrievalPolicy
+
+        self.retrieval_policy = RetrievalPolicy.from_value(retrieval_policy)
         self.tool_result_policy = ToolResultPolicy.from_value(tool_result_policy)
         self.approval_store = approval_store
         self.delegation_config = normalize_delegation_config(delegation)
@@ -246,6 +413,15 @@ class MemAgent:
         self._turn_had_nondeterministic_tools = False
         self._turn_cache_domains: Set[str] = set()
         self._cache_bypass_reason: Optional[str] = None
+        self._last_completion_decisions = []
+        self._last_retrieved_memories: List[Dict[str, Any]] = []
+        self._last_retrieval_stats: Dict[str, Any] = {
+            "duration_ms": 0.0,
+            "candidate_count": 0,
+            "selected_count": 0,
+        }
+        self._last_memory_context_evidence: Dict[str, Any] = {}
+        self._last_memory_attribution_context = None
         self.skill_paths = self._normalize_skill_paths(skill_paths)
         self.skills: List[Dict[str, Any]] = []
         # MCP is a first-class client subsystem. It owns protocol negotiation,
@@ -290,6 +466,14 @@ class MemAgent:
             self.continual_learning_config[
                 "require_shadow"
             ] = validated_learning_config.require_shadow
+        from ..learning import LearningControlPlaneConfig
+
+        self.learning_control_plane_config = LearningControlPlaneConfig.from_value(
+            learning_control_plane, implied=self.continual_learning
+        )
+        self.learning_control_plane_enabled = bool(
+            self.learning_control_plane_config.enabled
+        )
         if workflow_outcome_evaluator is not None and not callable(
             workflow_outcome_evaluator
         ):
@@ -424,6 +608,7 @@ class MemAgent:
         )
         self._stream_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self._stream_trace_events: Optional[List[Dict[str, Any]]] = None
+        self._last_tool_outcomes: List[Dict[str, Any]] = []
         # Learned skills injected into the CURRENT turn's context — reset at
         # the top of every _build_context so attribution never leaks across
         # runs. Read by the workflow capture paths (skills_activated).
@@ -456,6 +641,9 @@ class MemAgent:
                 "mcp_list_tools",
                 "mcp_call_tool",
                 "semantic_list_models",
+                "list_agent_harnesses",
+                "run_harness_task",
+                "get_harness_run",
             },
             max_invocations_per_turn=self.context_policy.max_tool_invocations_per_turn,
             max_attempts_per_call=self.context_policy.max_tool_attempts_per_call,
@@ -559,6 +747,29 @@ class MemAgent:
         except Exception as exc:
             logger.warning("Self-awareness initialization failed: %s", exc)
 
+        if meta_harness:
+            try:
+                if hasattr(meta_harness, "run") and hasattr(
+                    meta_harness, "list_harnesses"
+                ):
+                    self.meta_harness = meta_harness
+                else:
+                    from ..metaharness import MetaHarness
+
+                    self.meta_harness = MetaHarness.from_env(
+                        memory_provider=self.memory_provider,
+                        agent=self,
+                        approval_store=self.approval_store,
+                    )
+                    self._owns_meta_harness = True
+                if self.meta_harness_mode is None:
+                    self.meta_harness_mode = "delegate"
+                if self.meta_harness_mode == "delegate":
+                    self._register_meta_harness_tools()
+            except Exception as exc:
+                logger.warning("Meta-harness initialization failed: %s", exc)
+                raise
+
         logger.info(
             f"MemAgent {self.agent_id} initialized with memory types: {self.active_memory_types}"
         )
@@ -594,6 +805,33 @@ class MemAgent:
             errors.append("approval_store does not implement ApprovalStore")
         if self.delegates and not self.memory_provider:
             errors.append("delegation requires a shared memory provider")
+        if self.meta_harness_mode and self.meta_harness is None:
+            errors.append("meta_harness_mode requires a configured meta-harness")
+        if self.meta_harness is not None and self.default_harness != "auto":
+            normalized_harness = {
+                "claude": "claude-code",
+                "claudecode": "claude-code",
+                "open-hands": "openhands",
+                "native": "memagent",
+                "memorizz": "memagent",
+            }.get(self.default_harness, self.default_harness)
+            adapters = getattr(self.meta_harness, "adapters", {})
+            if normalized_harness not in adapters:
+                errors.append(
+                    f"default harness {self.default_harness!r} is not registered"
+                )
+            elif normalized_harness == "memagent":
+                try:
+                    capability = self.meta_harness.probe(normalized_harness)
+                    if (
+                        str((capability.get("metadata") or {}).get("agent_id") or "")
+                        == self.agent_id
+                    ):
+                        errors.append(
+                            "a MemAgent cannot use itself as its default native harness"
+                        )
+                except Exception as exc:
+                    errors.append(f"default harness validation failed: {exc}")
         report = {"ok": not errors, "errors": errors, "agent_id": self.agent_id}
         if errors:
             raise ValueError("; ".join(errors))
@@ -637,13 +875,45 @@ class MemAgent:
             "registered_tool_count": len(self.tool_manager.list_tools()),
             "skill_retrieval": bool(self.skill_retrieval),
             "continual_learning": bool(self.continual_learning),
+            "learning_control_plane": {
+                "enabled": self.learning_control_plane is not None,
+                "configured": self.learning_control_plane_enabled,
+                "evidence_token_budget": (
+                    self.learning_control_plane_config.evidence_token_budget
+                ),
+                "compiler_enabled": self.learning_control_plane_config.compiler_enabled,
+                "forgetting_enabled": self.learning_control_plane_config.forgetting_enabled,
+            },
             "delegates": [item.agent_id for item in self.delegates],
+            "delegation": {
+                "enabled": bool(
+                    self.delegates and self.delegation_config.get("enabled", True)
+                ),
+                "mode": self.delegation_config.get("mode"),
+                "consolidation_strategy": self.delegation_config.get(
+                    "consolidation_strategy", "model"
+                ),
+                "evidence_context": self.delegation_config.get(
+                    "evidence_context", True
+                ),
+                "verified_read_only_cache_policy": True,
+            },
             "durable_approval_store": (
                 type(self.approval_store).__name__
                 if self.approval_store is not None
                 else "SQLiteApprovalStore (lazy)"
             ),
             "semantic_layer": self.semantic_layer is not None,
+            "meta_harness": {
+                "enabled": self.meta_harness is not None,
+                "mode": self.meta_harness_mode,
+                "default_harness": self.default_harness,
+                "harnesses": (
+                    self.meta_harness.list_harnesses()
+                    if self.meta_harness is not None
+                    else []
+                ),
+            },
         }
         if (
             preflight
@@ -793,6 +1063,13 @@ class MemAgent:
             for row in tool_logs
             if row.get("success") is False or bool(row.get("error"))
         )
+        tool_outcomes: Dict[str, int] = {}
+        for row in tool_logs:
+            outcome = str(
+                row.get("outcome")
+                or ("success" if row.get("success") is not False else "error")
+            ).lower()
+            tool_outcomes[outcome] = tool_outcomes.get(outcome, 0) + 1
 
         return {
             "agent_id": self.agent_id,
@@ -821,6 +1098,7 @@ class MemAgent:
                 "count": len(tool_logs),
                 "failure_count": tool_failures,
                 "success_count": len(tool_logs) - tool_failures,
+                "outcomes": tool_outcomes,
             },
             "workflows": {
                 "count": len(workflows),
@@ -838,6 +1116,113 @@ class MemAgent:
                 for rows in (conversation_rows, tool_logs, workflows, summaries)
             ),
         }
+
+    def learning_report(
+        self,
+        *,
+        memory_id: Optional[str] = None,
+        user_id: Any = ...,
+        thread_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return control-plane events, artifacts and latest decisions."""
+        if self.learning_control_plane is None:
+            return {
+                "enabled": False,
+                "agent_id": self.agent_id,
+                "configured": self.learning_control_plane_enabled,
+            }
+        return self.learning_control_plane.report(
+            memory_id=memory_id, user_id=user_id, thread_id=thread_id
+        )
+
+    def explain_memory_decision(
+        self, *, include_content: bool = False
+    ) -> Dict[str, Any]:
+        """Explain why the last EvidencePack selected or rejected memories."""
+        if self.learning_control_plane is None:
+            return {"available": False, "reason": "learning control plane disabled"}
+        return self.learning_control_plane.explain_last_retrieval(
+            include_content=include_content
+        )
+
+    def compile_memory(
+        self,
+        *,
+        memory_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        mode: str = "fast",
+    ) -> Dict[str, Any]:
+        """Synchronously compile pending learning events into retrieval artifacts."""
+        if self.learning_control_plane is None:
+            raise ValueError("learning control plane is disabled")
+        return self.learning_control_plane.compile(
+            memory_id=memory_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            mode=mode,
+        ).to_dict()
+
+    def plan_forgetting(
+        self,
+        *,
+        memory_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        max_candidates: int = 500,
+    ):
+        """Create a dry-run, reversible forgetting plan."""
+        if self.learning_control_plane is None:
+            raise ValueError("learning control plane is disabled")
+        return self.learning_control_plane.plan_forgetting(
+            memory_id=memory_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            max_candidates=max_candidates,
+        )
+
+    def apply_forgetting(
+        self,
+        report,
+        *,
+        approved_by: str,
+        reason: Optional[str] = None,
+        memory_id: Optional[str] = None,
+        user_id: Any = ...,
+        thread_id: Optional[str] = None,
+    ):
+        """Apply a dry-run forgetting plan with an auditable operator identity."""
+        if self.learning_control_plane is None:
+            raise ValueError("learning control plane is disabled")
+        resolved_user_id = self._current_user_id if user_id is ... else user_id
+        return self.learning_control_plane.apply_forgetting(
+            report,
+            approved_by=approved_by,
+            reason=reason,
+            scope={
+                "memory_id": memory_id or self._current_memory_id,
+                "user_id": resolved_user_id,
+                "thread_id": thread_id or self._current_thread_id,
+            },
+        )
+
+    def get_forgetting_plan(
+        self,
+        plan_id: str,
+        *,
+        memory_id: Optional[str] = None,
+        user_id: Any = ...,
+        thread_id: Optional[str] = None,
+    ):
+        """Load a durable forgetting plan for approval after a restart."""
+        if self.learning_control_plane is None:
+            raise ValueError("learning control plane is disabled")
+        return self.learning_control_plane.get_forgetting_plan(
+            plan_id,
+            memory_id=memory_id,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
 
     @property
     def llm_model(self) -> Optional[str]:
@@ -874,6 +1259,14 @@ class MemAgent:
                     "Ignoring unsupported memory_types payload type: %s",
                     type(memory_types).__name__,
                 )
+
+            # An explicitly empty collection means that the caller wants a
+            # stateless agent.  Falling through to the defaults here used to
+            # re-enable conversation, workflow, and summary memory, which was
+            # both surprising and capable of triggering persistence attempts
+            # when no provider was configured.
+            if raw_values == []:
+                return []
 
             if raw_values:
                 # Convert string memory types to MemoryType enums if needed.
@@ -1043,6 +1436,35 @@ class MemAgent:
             )
         if self.authored_skills:
             self._persist_authored_skills()
+
+        # A thin event/evidence layer over the existing provider,
+        # observability store, and workflow-to-skill loop.
+        self.learning_control_plane = None
+        if self.learning_control_plane_enabled:
+            if not memory_provider:
+                logger.warning(
+                    "learning_control_plane is enabled but no memory provider is "
+                    "available; the control plane is disabled"
+                )
+            else:
+                try:
+                    from ..learning import LearningControlPlane
+
+                    self.learning_control_plane = LearningControlPlane(
+                        memory_provider,
+                        agent_id=self.agent_id,
+                        config=self.learning_control_plane_config,
+                    )
+                    if self.continual_learning_manager is not None:
+                        self.continual_learning_manager.control_plane = (
+                            self.learning_control_plane
+                        )
+                except Exception as exc:
+                    if not self.learning_control_plane_config.fail_open:
+                        raise
+                    logger.warning(
+                        "Learning control plane failed to initialize: %s", exc
+                    )
 
     def _initialize_context_window_tokens(
         self, explicit_value: Optional[int], llm_config: Optional[Dict[str, Any]]
@@ -1443,6 +1865,15 @@ class MemAgent:
             sections.append(learned_skills_section)
         rendered_skills = list(rendered_skills or [])
 
+        evidence_pack = context.get("evidence_pack")
+        if evidence_pack is not None:
+            try:
+                rendered_evidence = evidence_pack.render()
+            except Exception:
+                rendered_evidence = ""
+            if rendered_evidence:
+                sections.append(rendered_evidence)
+
         # Final context-boundary guard: even callers that manually inject
         # workflow memory cannot co-inject a raw run covered by a skill that
         # was rendered above.
@@ -1450,10 +1881,22 @@ class MemAgent:
             context.get("retrieved_memories") or [],
             rendered_skills,
         )
-        if retrieved:
+        if retrieved and evidence_pack is None:
             lines = []
             for item in retrieved:
                 source = item.get("source") or "memory"
+                source_id = (
+                    item.get("parent_source_id")
+                    or item.get("source_id")
+                    or item.get("id")
+                )
+                linked_source_ids = list(item.get("linked_source_ids") or [])
+                if linked_source_ids:
+                    identifier = "; ids=" + ",".join(
+                        str(value) for value in linked_source_ids
+                    )
+                else:
+                    identifier = f"; id={source_id}" if source_id else ""
                 stamp = ""
                 ts = item.get("timestamp")
                 if ts:
@@ -1461,7 +1904,7 @@ class MemAgent:
                         stamp = datetime.fromtimestamp(float(ts)).strftime(" %Y-%m-%d")
                     except Exception:
                         stamp = ""
-                lines.append(f"• [{source}{stamp}] {item.get('text', '')}")
+                lines.append(f"• [{source}{stamp}{identifier}] {item.get('text', '')}")
             sections.append(
                 "Relevant memories retrieved for this turn (deduplicated; may "
                 "be incomplete — use your memory tools for anything deeper):\n"
@@ -1487,6 +1930,24 @@ class MemAgent:
                     + "\nUse the entity memory tools to keep these facts up to date."
                 )
 
+        personalization_value = context.get("personalization_context")
+        if personalization_value:
+            try:
+                from ..personalization import PersonalizationContext
+
+                personalization = PersonalizationContext.from_value(
+                    personalization_value
+                )
+                rendered_personalization = personalization.render()
+            except Exception as exc:
+                logger.warning("Personalization context rendering failed: %s", exc)
+                rendered_personalization = ""
+            if rendered_personalization:
+                sections.append(
+                    "Personalization context for this turn:\n"
+                    + rendered_personalization
+                )
+
         summaries = context.get("summaries") or []
         if summaries:
             summary_lines = []
@@ -1509,9 +1970,13 @@ class MemAgent:
             sections.append(recent_digest)
 
         if request_context:
+            visible_request_context = dict(request_context)
+            # The typed block above is already rendered with its own authority
+            # and usage rules. Avoid injecting a duplicate raw JSON copy.
+            visible_request_context.pop("personalization_context", None)
             try:
                 rendered_context = json.dumps(
-                    request_context,
+                    visible_request_context,
                     ensure_ascii=False,
                     indent=2,
                     default=str,
@@ -1547,6 +2012,7 @@ class MemAgent:
                 agent_id=self.agent_id,
                 limit=20,
                 user_id=self._current_user_id,
+                thread_id=self._current_thread_id,
             )
             return {"summaries": summaries}
 
@@ -1560,7 +2026,12 @@ class MemAgent:
                 return {"error": "No memory provider configured."}
 
             # Load the summary document
-            summary_doc = self.fetch_context_summary(summary_id)
+            summary_doc = self.fetch_context_summary(
+                summary_id,
+                memory_id=self._current_memory_id,
+                user_id=self._current_user_id,
+                thread_id=self._current_thread_id,
+            )
             if not summary_doc:
                 return {"error": f"Summary '{summary_id}' not found."}
 
@@ -1580,7 +2051,9 @@ class MemAgent:
             )
             if source_ids and self.memory_manager:
                 original_msgs = self.memory_manager.get_messages_by_ids(
-                    source_ids, user_id=self._current_user_id
+                    source_ids,
+                    user_id=self._current_user_id,
+                    thread_id=self._current_thread_id,
                 )
                 if original_msgs:
                     reconstructed = []
@@ -1706,8 +2179,13 @@ class MemAgent:
                 user_id=self._current_user_id,
                 thread_id=self._current_thread_id,
             )
+            if not isinstance(raw_logs, (list, tuple)):
+                return {
+                    "error": "Memory provider returned an invalid tool-log result.",
+                    "logs": [],
+                }
             enriched: List[Dict[str, Any]] = []
-            for row in raw_logs or []:
+            for row in raw_logs:
                 if not isinstance(row, dict):
                     continue
                 item = dict(row)
@@ -1833,14 +2311,36 @@ class MemAgent:
         """Return summary registry entries."""
         return list(self._summary_registry)
 
-    def fetch_context_summary(self, summary_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve a stored summary document by ID."""
+    def fetch_context_summary(
+        self,
+        summary_id: str,
+        *,
+        memory_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve a summary only inside the requested tenant/thread scope."""
         if not self.memory_provider or not hasattr(
             self.memory_provider, "retrieve_by_id"
         ):
             return None
         try:
-            return self.memory_provider.retrieve_by_id(summary_id, MemoryType.SUMMARIES)
+            document = self.memory_provider.retrieve_by_id(
+                summary_id, MemoryType.SUMMARIES
+            )
+            if not isinstance(document, dict):
+                return None
+            if document.get("user_id") != user_id:
+                return None
+            if memory_id is not None and str(document.get("memory_id") or "") != str(
+                memory_id
+            ):
+                return None
+            if thread_id is not None and self.memory_manager._entry_thread_id(
+                document
+            ) != str(thread_id):
+                return None
+            return document
         except Exception as exc:
             logger.warning("Failed to fetch summary %s: %s", summary_id, exc)
             return None
@@ -2859,6 +3359,204 @@ class MemAgent:
 
     # --- Sandbox access ---
 
+    # --- Meta-harness access ---
+
+    def with_meta_harness(
+        self,
+        meta_harness: Any = None,
+        *,
+        mode: str = "delegate",
+        default_harness: str = "auto",
+        config: Optional[Dict[str, Any]] = None,
+    ) -> "MemAgent":
+        """Attach or replace the external agent meta-harness at runtime."""
+        normalized = str(mode or "delegate").strip().lower()
+        if normalized not in {"delegate", "runtime"}:
+            raise ValueError("meta-harness mode must be delegate or runtime")
+        if meta_harness is None:
+            from ..metaharness import MetaHarness
+
+            meta_harness = MetaHarness.from_env(
+                memory_provider=self.memory_provider,
+                agent=self,
+                approval_store=self.approval_store,
+            )
+            self._owns_meta_harness = True
+        self.meta_harness = meta_harness
+        self.meta_harness_mode = normalized
+        self.default_harness = (
+            str(default_harness or "auto").strip().lower().replace("_", "-")
+        )
+        self.harness_config = dict(config or {})
+        if normalized == "delegate":
+            self._register_meta_harness_tools()
+        return self
+
+    def has_meta_harness(self) -> bool:
+        return self.meta_harness is not None
+
+    def run_on_harness(
+        self,
+        query: str,
+        *,
+        workspace: Optional[str] = None,
+        harness: Optional[str] = None,
+        memory_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        write: Optional[bool] = None,
+        verification_command: Optional[str] = None,
+        execution_backend: Optional[str] = None,
+        model_initiated: bool = False,
+    ):
+        """Execute a complete turn through a configured harness."""
+        if self.meta_harness is None:
+            raise ValueError("No meta-harness is configured")
+        from ..metaharness import (
+            HarnessBudget,
+            HarnessPermissions,
+            HarnessTask,
+            VerificationSpec,
+        )
+
+        memory_id, thread_id = self._resolve_execution_state(memory_id, thread_id)
+        configured = dict(self.harness_config or {})
+        resolved_workspace = str(
+            workspace
+            or (context or {}).get("workspace")
+            or configured.get("workspace")
+            or os.getcwd()
+        )
+        permission_config = dict(configured.get("permissions") or {})
+        if write is not None:
+            permission_config["workspace_mode"] = "direct" if write else "read_only"
+        permissions = HarnessPermissions.from_value(permission_config)
+        budget = HarnessBudget.from_value(configured.get("budget"))
+        verification = VerificationSpec.from_value(
+            {
+                **dict(configured.get("verification") or {}),
+                **(
+                    {"command": verification_command, "required": True}
+                    if verification_command
+                    else {}
+                ),
+            }
+        )
+        metadata = dict(configured.get("metadata") or {})
+        # A MemAgent must never route a tool or full turn back into the same
+        # in-process adapter. The router compares this ID with the wrapped
+        # native agent while still allowing an explicitly different MemAgent.
+        metadata["origin_agent_id"] = self.agent_id
+        metadata["model_initiated"] = bool(model_initiated)
+        if execution_backend:
+            metadata["execution_backend"] = execution_backend
+        task = HarnessTask(
+            task=query,
+            workspace=resolved_workspace,
+            harness=harness or self.default_harness,
+            memory_id=memory_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            agent_id=self.agent_id,
+            model=configured.get("model"),
+            mode=self.meta_harness_mode or "delegate",
+            permissions=permissions,
+            budget=budget,
+            verification=verification,
+            output_schema=configured.get("output_schema"),
+            context=dict(context or {}),
+            metadata=metadata,
+        )
+        result = self.meta_harness.run(task)
+        if result.status.value == "succeeded" and result.final_response:
+            self._record_interaction(
+                query,
+                result.final_response,
+                memory_id,
+                thread_id,
+                user_id=user_id,
+            )
+        return result
+
+    def resume_harness_approval(self, proposal_id: str):
+        """Consume an approved run envelope and return structured evidence."""
+        if self.meta_harness is None:
+            raise ValueError("No meta-harness is configured")
+        result = self.meta_harness.resume_approval(proposal_id)
+        if result.status.value == "succeeded" and result.final_response:
+            run = self.meta_harness.get_run(result.run_id) or {}
+            task = dict(run.get("task") or {})
+            self._record_interaction(
+                str(task.get("task") or ""),
+                result.final_response,
+                task.get("memory_id"),
+                task.get("thread_id"),
+                user_id=task.get("user_id"),
+            )
+        return result
+
+    def _register_meta_harness_tools(self) -> None:
+        if not self.meta_harness or self._meta_harness_tools_registered:
+            return
+
+        @governed_tool(
+            deterministic=False,
+            side_effects=True,
+            requires_approval=False,
+            domains=("workspace", "metaharness"),
+        )
+        def run_harness_task(
+            task: str,
+            workspace: str,
+            harness: str = "auto",
+            write: bool = False,
+            verification_command: Optional[str] = None,
+            execution_backend: str = "local",
+        ) -> Dict[str, Any]:
+            """Delegate a bounded workspace task to an external agent harness.
+
+            Write-capable, networked, or secret-bearing runs return a durable
+            host approval proposal before execution.
+            """
+            result = self.run_on_harness(
+                task,
+                workspace=workspace,
+                harness=harness,
+                memory_id=self._current_memory_id,
+                thread_id=self._current_thread_id,
+                user_id=self._current_user_id,
+                write=write,
+                verification_command=verification_command,
+                execution_backend=execution_backend,
+                model_initiated=True,
+            )
+            return result.to_dict()
+
+        @governed_tool(
+            deterministic=True,
+            side_effects=False,
+            domains=("metaharness",),
+        )
+        def get_harness_run(run_id: str) -> Dict[str, Any]:
+            """Read one durable harness run and its verification result."""
+            value = self.meta_harness.get_run(run_id)
+            return value or {"ok": False, "error_code": "run_not_found"}
+
+        @governed_tool(
+            deterministic=True,
+            side_effects=False,
+            domains=("metaharness",),
+        )
+        def list_agent_harnesses() -> Dict[str, Any]:
+            """List configured harnesses and current capability probes."""
+            values = self.meta_harness.list_harnesses()
+            return {"ok": True, "harnesses": values, "count": len(values)}
+
+        for tool in (run_harness_task, get_harness_run, list_agent_harnesses):
+            self.tool_manager.add_tool(tool)
+        self._meta_harness_tools_registered = True
+
     def with_sandbox_provider(
         self,
         provider: Optional[Union[str, Dict[str, Any], "SandboxProvider"]],
@@ -3239,7 +3937,11 @@ class MemAgent:
                 resolved_thread_id = str(uuid.uuid4())
                 logger.debug("Started new thread: %s", resolved_thread_id)
 
-        self._thread_ids_by_memory[resolved_memory_id] = resolved_thread_id
+        # ContextVars copy values when an asyncio task is spawned. Copy before
+        # mutation so sibling tasks never share the same inherited dict.
+        thread_ids_by_memory = dict(self._thread_ids_by_memory)
+        thread_ids_by_memory[resolved_memory_id] = resolved_thread_id
+        self._thread_ids_by_memory = thread_ids_by_memory
         self._current_thread_id = resolved_thread_id
 
         if self.cache_manager:
@@ -3247,7 +3949,988 @@ class MemAgent:
                 agent_id=self.agent_id, memory_id=resolved_memory_id
             )
 
+        self._ensure_agent_registered()
+
         return resolved_memory_id, resolved_thread_id
+
+    def _ensure_agent_registered(self) -> None:
+        """Fail-soft upsert of this logical agent and its current memories.
+
+        Applications should not have to remember a separate ``save()`` call in
+        order for observability to work. Registration remains fail-soft so a
+        read-only provider or a transient database outage never blocks chat.
+        """
+        provider = self.memory_provider
+        desired_memory_ids = {str(item) for item in self.memory_ids if item}
+        if (
+            not self.auto_register
+            or provider is None
+            or not hasattr(provider, "store_memagent")
+            or desired_memory_ids.issubset(self._registered_memory_ids)
+        ):
+            return
+
+        with self._registration_lock:
+            desired_memory_ids = {str(item) for item in self.memory_ids if item}
+            if desired_memory_ids.issubset(self._registered_memory_ids):
+                return
+            try:
+                persistence.save_agent(self)
+                self._registered_memory_ids = desired_memory_ids
+                self._registration_attempted = True
+            except Exception as exc:
+                level = (
+                    logging.DEBUG if self._registration_attempted else logging.WARNING
+                )
+                logger.log(
+                    level,
+                    "MemAgent auto-registration failed for %s: %s",
+                    self.agent_id,
+                    exc,
+                )
+                self._registration_attempted = True
+
+    def _trace_identity_payload(self) -> Dict[str, Any]:
+        """Return the canonical, content-free identity envelope for this turn."""
+        return {
+            "schema_version": 2,
+            "application_id": self.application_id,
+            "agent_id": self.agent_id,
+            "run_id": self._current_run_id,
+            "turn_id": self._current_turn_id,
+            "root_trace_id": self._current_root_trace_id,
+            "memory_id": self._current_memory_id,
+            "thread_id": self._current_thread_id,
+            "user_id": self._current_user_id,
+            "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        }
+
+    def _begin_trace_turn(
+        self,
+        user_id: Optional[str],
+        *,
+        query: Optional[str] = None,
+        emit_start: bool = True,
+    ) -> None:
+        """Initialize an isolated trace collector and durable turn identity."""
+        self._current_user_id = user_id
+        session = session_for(self)
+        self._current_run_id = (
+            session.identity["run_id"] if session else str(uuid.uuid4())
+        )
+        self._current_turn_id = (
+            session.identity["turn_id"] if session else str(uuid.uuid4())
+        )
+        self._current_root_trace_id = (
+            session.identity["root_trace_id"] if session else str(uuid.uuid4())
+        )
+        self._current_parent_span_id = self._current_root_trace_id
+        self._stream_trace_events = []
+        self._last_tool_outcomes = []
+        self._last_memory_context_evidence = {}
+        self._last_selection_ledger = []
+        self._last_memory_attribution_context = None
+        self._last_trace_context = self._trace_identity_payload()
+        if query is not None and self.learning_control_plane is not None:
+            try:
+                self.learning_control_plane.begin_run(
+                    query, scope=self._trace_identity_payload()
+                )
+            except Exception as exc:
+                logger.debug("Learning run-start capture failed: %s", exc)
+        if emit_start:
+            self._emit_trace_turn_start()
+
+    def _emit_trace_turn_start(self) -> None:
+        """Emit the root span after stream_start when a callback is present."""
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "turn_start",
+                "title": "Agent turn started",
+                "trace_id": f"turn:{self._current_turn_id}:start",
+                "span_id": self._current_root_trace_id,
+                "parent_span_id": None,
+                "status": "started",
+                "content": "",
+            },
+        )
+
+    def _sanitize_observability_context(
+        self, value: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Return the bounded, content-free host provenance allowlist."""
+        if not isinstance(value, dict):
+            return {}
+        safe: Dict[str, Any] = {}
+        for key in _OBSERVABILITY_CONTEXT_FIELDS:
+            item = value.get(key)
+            if item is None:
+                continue
+            if key == "grounding_source_ids":
+                if isinstance(item, (list, tuple, set)):
+                    safe[key] = [str(entry)[:240] for entry in list(item)[:16]]
+                continue
+            if isinstance(item, bool):
+                safe[key] = item
+            elif isinstance(item, (int, float)):
+                safe[key] = item
+            elif isinstance(item, str):
+                safe[key] = item[:240]
+        return safe
+
+    def _emit_context_provenance_trace(
+        self,
+        observability_context: Optional[Dict[str, Any]],
+        request_context: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist hashes/status/ids needed to diagnose wrong-context turns.
+
+        The LLM-visible request context itself is never copied into this event.
+        A deterministic fingerprint lets operators compare two turns while the
+        allowlisted host fields explain the route/thread/grounding decision.
+        """
+        safe = self._sanitize_observability_context(observability_context)
+        safe["request_context_fingerprint"] = self._fingerprint(
+            dict(request_context or {})
+        )
+        safe["request_context_key_count"] = len(dict(request_context or {}))
+        safe.setdefault("request_context_present", bool(request_context))
+        metadata = {
+            key: (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(value, list)
+                else value
+            )
+            for key, value in safe.items()
+        }
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "context_provenance",
+                "title": "Request context provenance",
+                "trace_id": f"context:{self._current_turn_id}",
+                "span_id": str(uuid.uuid4()),
+                "parent_span_id": self._current_root_trace_id,
+                "status": "verified" if safe.get("ownership_verified") else "recorded",
+                "content": json.dumps(
+                    safe, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
+                **metadata,
+            },
+        )
+
+    def _attach_personalization_context(
+        self,
+        built_context: Dict[str, Any],
+        request_context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Attach a typed host context without duplicating entity profiles."""
+        raw = (
+            request_context.get("personalization_context")
+            if isinstance(request_context, dict)
+            else None
+        )
+        if not raw:
+            return built_context
+        try:
+            from ..personalization import PersonalizationContext
+
+            personalization = PersonalizationContext.from_value(raw)
+        except Exception as exc:
+            logger.warning("Ignoring invalid personalization context: %s", exc)
+            return built_context
+        result = dict(built_context)
+        result["personalization_context"] = personalization
+        # A host-built context may already contain the same entity retrieval.
+        # Keep one authoritative rendering and one observable supply record.
+        if personalization.policy.include_entity_memory:
+            result.pop("entity_memory_profiles", None)
+            result.pop("entity_memory_retrieval", None)
+        return result
+
+    @staticmethod
+    def _host_owns_entity_personalization(
+        request_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Avoid a second entity lookup when the host supplied that source."""
+        raw = (
+            request_context.get("personalization_context")
+            if isinstance(request_context, dict)
+            else None
+        )
+        if not raw:
+            return False
+        try:
+            from ..personalization import PersonalizationContext
+
+            return PersonalizationContext.from_value(raw).policy.include_entity_memory
+        except Exception:
+            return False
+
+    @staticmethod
+    def _memory_row_identifier(row: Any, fallback: str) -> str:
+        if not isinstance(row, dict):
+            return fallback
+        for key in (
+            "parent_source_id",
+            "source_id",
+            "entity_id",
+            "summary_id",
+            "id",
+            "_id",
+            "thread_id",
+        ):
+            value = row.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+        content = row.get("content")
+        if isinstance(content, dict):
+            for key in ("id", "thread_id", "summary_id"):
+                value = content.get(key)
+                if value is not None and str(value).strip():
+                    return str(value)
+        return fallback
+
+    @staticmethod
+    def _memory_row_text(row: Any) -> str:
+        if not isinstance(row, dict):
+            return ""
+        for key in ("text", "summary_content", "content", "excerpt"):
+            value = row.get(key)
+            if isinstance(value, dict):
+                value = value.get("content") or value.get("text")
+            if value is not None and str(value).strip():
+                return str(value)
+        return ""
+
+    def _emit_memory_context_trace(
+        self,
+        built_context: Dict[str, Any],
+    ) -> None:
+        """Persist content-free evidence for every memory item sent to the LLM."""
+        from ..personalization import PersonalizationContext, PersonalizationPolicy
+
+        history = [
+            row
+            for row in (built_context.get("conversation_history") or [])
+            if isinstance(row, dict)
+        ]
+        semantic = [
+            row
+            for row in (built_context.get("retrieved_memories") or [])
+            if isinstance(row, dict)
+        ]
+        entities = [
+            row
+            for row in (built_context.get("entity_memory_profiles") or [])
+            if isinstance(row, dict)
+        ]
+        summaries = [
+            row
+            for row in (built_context.get("summaries") or [])
+            if isinstance(row, dict)
+        ]
+        has_personalization = built_context.get("personalization_context") is not None
+        personalization = PersonalizationContext.from_value(
+            built_context.get("personalization_context")
+        )
+        personalization_summary = personalization.trace_summary()
+        if personalization.entity_profiles:
+            entities = list(personalization.entity_profiles)
+
+        entity_attribute_count = 0
+        entity_char_count = 0
+        entity_refs: List[Dict[str, Any]] = []
+        for index, profile in enumerate(entities):
+            raw_attributes = profile.get("attributes") or {}
+            if isinstance(raw_attributes, dict):
+                attribute_names = sorted(str(key) for key in raw_attributes)[:32]
+            else:
+                attribute_names = sorted(
+                    str(item.get("name"))
+                    for item in raw_attributes
+                    if isinstance(item, dict) and item.get("name")
+                )[:32]
+            entity_attribute_count += len(attribute_names)
+            if isinstance(raw_attributes, dict):
+                entity_char_count += sum(
+                    len(str(key)) + len(str(value))
+                    for key, value in raw_attributes.items()
+                )
+            else:
+                entity_char_count += sum(
+                    len(str(item.get("name") or "")) + len(str(item.get("value") or ""))
+                    for item in raw_attributes
+                    if isinstance(item, dict)
+                )
+            identifier = self._memory_row_identifier(profile, f"entity:{index}")
+            entity_refs.append(
+                {
+                    "ref": self._fingerprint(identifier),
+                    "attribute_names": attribute_names,
+                }
+            )
+
+        semantic_refs = [
+            {
+                "ref": self._fingerprint(
+                    self._memory_row_identifier(row, f"semantic:{index}")
+                ),
+                "source": str(row.get("source") or "memory")[:40],
+                "score": row.get("score"),
+            }
+            for index, row in enumerate(semantic)
+        ]
+        summary_refs = [
+            self._fingerprint(self._memory_row_identifier(row, f"summary:{index}"))
+            for index, row in enumerate(summaries)
+        ]
+        source_counts = {
+            "history_messages": len(history),
+            "semantic_memories": len(semantic),
+            "entity_profiles": len(entities),
+            "entity_attributes": entity_attribute_count,
+            "summaries": len(summaries),
+            "preferences": int(
+                personalization_summary.get("source_counts", {}).get("preferences", 0)
+            ),
+            "conversation_memories": int(
+                personalization_summary.get("source_counts", {}).get(
+                    "conversation_memories", 0
+                )
+            ),
+            "writing_samples": int(
+                personalization_summary.get("source_counts", {}).get(
+                    "writing_samples", 0
+                )
+            ),
+        }
+        supplied_count = sum(
+            source_counts[source]
+            for source in (
+                "history_messages",
+                "semantic_memories",
+                "entity_attributes",
+                "summaries",
+                "preferences",
+                "conversation_memories",
+                "writing_samples",
+            )
+        )
+        entity_retrieval = built_context.get("entity_memory_retrieval") or {}
+        personalization_diagnostics = personalization_summary.get("diagnostics") or {}
+        degraded = bool(
+            entity_retrieval.get("degraded")
+            or personalization_diagnostics.get("degraded")
+        )
+        fallback_used = bool(
+            entity_retrieval.get("fallback_used")
+            or personalization_diagnostics.get("fallback_used")
+        )
+        volatile_chars = sum(
+            len(self._memory_row_text(row)) for row in [*history, *semantic, *summaries]
+        ) + int(personalization_summary.get("rendered_char_count") or 0)
+        if personalization.is_empty:
+            volatile_chars += entity_char_count
+        automatic_entity_candidate_count = int(
+            (
+                entity_retrieval.get("fallback_candidate_count")
+                if entity_retrieval.get("fallback_used")
+                else entity_retrieval.get("semantic_match_count")
+            )
+            or 0
+        )
+        semantic_candidate_count = int(
+            (self._last_retrieval_stats or {}).get("candidate_count") or 0
+        )
+        personalization_candidate_count = int(
+            personalization_diagnostics.get("candidate_count") or 0
+        )
+        personalization_owns_entity = bool(
+            has_personalization and personalization.policy.include_entity_memory
+        )
+        personalization_selected_count = int(
+            personalization_diagnostics.get("selected_count") or 0
+        )
+        payload = {
+            "schema_version": 1,
+            "stage": "supplied",
+            "source_counts": source_counts,
+            "retrieved_candidate_count": (
+                semantic_candidate_count
+                + automatic_entity_candidate_count
+                + personalization_candidate_count
+            ),
+            "retrieved_source_counts": {
+                "semantic": semantic_candidate_count,
+                "entity": (
+                    int(personalization_diagnostics.get("entity_candidate_count") or 0)
+                    if personalization_owns_entity
+                    else automatic_entity_candidate_count
+                ),
+                "conversation_personalization": int(
+                    personalization_diagnostics.get("conversation_candidate_count") or 0
+                ),
+            },
+            "retrieved_selected_count": (
+                len(semantic)
+                + (
+                    personalization_selected_count
+                    if has_personalization
+                    else len(entities)
+                )
+            ),
+            "retrieved_selected_source_counts": {
+                "semantic": len(semantic),
+                "entity": (
+                    int(personalization_diagnostics.get("entity_selected_count") or 0)
+                    if personalization_owns_entity
+                    else len(entities)
+                ),
+                "conversation_personalization": int(
+                    personalization_diagnostics.get("conversation_selected_count") or 0
+                ),
+            },
+            "supplied_count": supplied_count,
+            "injected_char_count": volatile_chars,
+            "degraded": degraded,
+            "fallback_used": fallback_used,
+            "semantic_refs": semantic_refs,
+            "entity_refs": entity_refs,
+            "summary_refs": summary_refs,
+            "preference_keys": personalization_summary.get("preference_keys") or [],
+            "conversation_refs": personalization_summary.get("conversation_refs") or [],
+            "writing_sample_refs": personalization_summary.get("writing_sample_refs")
+            or [],
+            "entity_retrieval": {
+                key: entity_retrieval.get(key)
+                for key in (
+                    "retrieval_mode",
+                    "semantic_attempted",
+                    "semantic_match_count",
+                    "fallback_used",
+                    "fallback_candidate_count",
+                    "match_count",
+                    "degraded",
+                    "degraded_reason",
+                )
+                if entity_retrieval.get(key) is not None
+            },
+            "personalization_retrieval": personalization_diagnostics,
+        }
+        self._last_memory_context_evidence = dict(payload)
+        selection_ledger = getattr(self, "_last_selection_ledger", [])
+        if selection_ledger:
+            self._emit_stream_event(
+                "trace",
+                {
+                    "trace_kind": "memory_selection",
+                    "title": "Memory selection decisions",
+                    "trace_id": f"selection:{self._current_turn_id}",
+                    "span_id": str(uuid.uuid4()),
+                    "parent_span_id": self._current_root_trace_id,
+                    "status": "success",
+                    "selection_ledger": selection_ledger,
+                },
+            )
+
+        def _attribution_rows(
+            rows: List[Dict[str, Any]], source: str
+        ) -> List[Dict[str, Any]]:
+            return [{**row, "_memorizz_reference_source": source} for row in rows]
+
+        attribution_memories = _attribution_rows(semantic, "semantic_memory")
+        attribution_memories.extend(
+            _attribution_rows(
+                list(personalization.conversation_memories), "conversation"
+            )
+        )
+        attribution_memories.extend(_attribution_rows(history, "history"))
+        attribution_memories.extend(_attribution_rows(summaries, "summary"))
+        self._last_memory_attribution_context = PersonalizationContext(
+            entity_profiles=entities,
+            preferences=personalization.preferences,
+            conversation_memories=attribution_memories,
+            writing_samples=personalization.writing_samples,
+            policy=PersonalizationPolicy(
+                max_entity_profiles=max(1, len(entities)),
+                max_conversation_memories=max(1, len(attribution_memories)),
+                max_preferences=max(1, len(personalization.preferences)),
+                max_writing_samples=max(1, len(personalization.writing_samples)),
+                max_chars=1,
+            ),
+        )
+
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "memory_context",
+                "input_refs": [
+                    entry["resource"] for entry in selection_ledger if entry["selected"]
+                ][:32],
+                "title": "Memory supplied",
+                "trace_id": f"memory:{self._current_turn_id}:supplied",
+                "span_id": str(uuid.uuid4()),
+                "parent_span_id": self._current_root_trace_id,
+                "status": "degraded" if degraded else "recorded",
+                "content": json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
+                "memory_history_count": len(history),
+                "memory_candidate_count": payload["retrieved_candidate_count"],
+                "memory_supplied_count": supplied_count,
+                "memory_injected_chars": volatile_chars,
+                "memory_degraded": degraded,
+                "memory_fallback_used": fallback_used,
+                "entity_profile_count": len(entities),
+                "preference_count": source_counts["preferences"],
+                "conversation_memory_count": source_counts["conversation_memories"],
+                "writing_sample_count": source_counts["writing_samples"],
+            },
+        )
+
+    def _emit_memory_reference_trace(self, response: str) -> None:
+        """Record conservative post-response attribution without raw content."""
+        context = self._last_memory_attribution_context
+        supplied = int(
+            (self._last_memory_context_evidence or {}).get("supplied_count") or 0
+        )
+        if context is None or supplied <= 0:
+            return
+        try:
+            payload = {
+                "schema_version": 1,
+                "stage": "referenced",
+                "supplied_count": supplied,
+                **context.referenced_by(response),
+            }
+        except Exception as exc:
+            logger.debug("Memory response attribution failed: %s", exc)
+            return
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "memory_reference",
+                "title": "Memory referenced",
+                "trace_id": f"memory:{self._current_turn_id}:referenced",
+                "span_id": str(uuid.uuid4()),
+                "parent_span_id": self._current_root_trace_id,
+                "status": "measured",
+                "content": json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
+                "memory_supplied_count": supplied,
+                "memory_referenced_count": payload["referenced_count"],
+            },
+        )
+
+    def _emit_cache_decision_trace(
+        self,
+        decision: str,
+        cache_metadata: Optional[Dict[str, Any]],
+        *,
+        bypass_reason: Optional[str] = None,
+    ) -> None:
+        """Record cache routing without query or response content."""
+        fingerprints = (cache_metadata or {}).get("fingerprints") or {}
+        payload: Dict[str, Any] = {
+            "cache_decision": str(decision)[:80],
+            "cache_enabled": bool(self.cache_manager.enabled),
+            "request_context_fingerprint": str(
+                fingerprints.get("request_context") or ""
+            )[:240],
+        }
+        if bypass_reason:
+            payload["cache_bypass_reason"] = str(bypass_reason)[:160]
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "cache_decision",
+                "title": f"Semantic cache · {decision}",
+                "trace_id": f"cache:{self._current_turn_id}:{decision}",
+                "span_id": str(uuid.uuid4()),
+                "parent_span_id": self._current_root_trace_id,
+                "status": str(decision)[:80],
+                "content": json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
+                **payload,
+            },
+        )
+
+    def _finish_trace_turn(
+        self, status: str, *, error_code: Optional[str] = None
+    ) -> None:
+        """Close the root turn span without persisting exception messages."""
+        payload: Dict[str, Any] = {
+            "trace_kind": "turn_result",
+            "title": "Agent turn completed"
+            if status == "success"
+            else "Agent turn failed",
+            "trace_id": f"turn:{self._current_turn_id}:result",
+            "span_id": self._current_root_trace_id,
+            "parent_span_id": None,
+            "status": status,
+            "success": status == "success",
+            "content": "",
+        }
+        if error_code:
+            payload["error_code"] = error_code
+        self._emit_stream_event("trace", payload)
+        self._last_trace_context = self._trace_identity_payload()
+        if self.learning_control_plane is not None:
+            try:
+                self.learning_control_plane.complete_run(
+                    "",
+                    status=status,
+                    metrics={"error_code": error_code} if error_code else {},
+                    scope=self._last_trace_context,
+                )
+            except Exception as exc:
+                logger.debug("Learning run-completion capture failed: %s", exc)
+
+    def get_trace_context(self) -> Dict[str, Any]:
+        """Return identifiers for linking application outcomes to the last turn."""
+        return {
+            key: value
+            for key, value in dict(self._last_trace_context or {}).items()
+            if value is not None
+        }
+
+    def observe(self, operation: str, *, trace_context=None, **kwargs):
+        """Observe a host action using this agent's provider and turn identity."""
+        from ..observability import ObservabilityRecorder
+
+        return ObservabilityRecorder(
+            self.memory_provider, trace_context or self.get_trace_context()
+        ).start_span(operation, **kwargs)
+
+    @property
+    def last_tool_outcomes(self) -> List[Dict[str, Any]]:
+        """Structured outcomes from the most recent turn, in execution order."""
+        return [dict(item) for item in (self._last_tool_outcomes or [])]
+
+    def record_feedback(
+        self,
+        rating: float,
+        *,
+        verified: bool = True,
+        source: str = "user",
+        label: Optional[str] = None,
+        comment: Optional[str] = None,
+        include_comment: bool = False,
+        trace_context: Optional[Dict[str, Any]] = None,
+        external_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Join verified application feedback to a concrete agent trace."""
+        if not self.memory_provider:
+            raise ValueError("record_feedback requires a memory provider")
+        from ..observability import ObservabilityStore
+
+        return ObservabilityStore(self.memory_provider).record_feedback(
+            trace_context=trace_context or self.get_trace_context(),
+            rating=rating,
+            verified=verified,
+            source=source,
+            label=label,
+            comment=comment,
+            include_comment=include_comment,
+            external_id=external_id,
+        )
+
+    def record_task_outcome(
+        self,
+        status: str,
+        *,
+        verified: bool = True,
+        source: str = "application",
+        score: Optional[float] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+        trace_context: Optional[Dict[str, Any]] = None,
+        external_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Join a business/task outcome to a concrete agent trace."""
+        if not self.memory_provider:
+            raise ValueError("record_task_outcome requires a memory provider")
+        resolved_trace_context = trace_context or self.get_trace_context()
+        if self.learning_control_plane is not None:
+            from ..learning import OutcomeEvidence
+
+            outcome = OutcomeEvidence.from_value(
+                status,
+                verified=verified,
+                source=source,
+                score=score,
+                metrics=metrics,
+            )
+            return self.learning_control_plane.record_outcome(
+                outcome,
+                scope=resolved_trace_context,
+                external_id=external_id,
+            )
+        from ..observability import ObservabilityStore
+
+        return ObservabilityStore(self.memory_provider).record_outcome(
+            trace_context=resolved_trace_context,
+            status=status,
+            verified=verified,
+            source=source,
+            score=score,
+            metrics=metrics,
+            external_id=external_id,
+        )
+
+    def _model_trace_metadata(self) -> Dict[str, Any]:
+        """Extract a bounded provider/model/usage snapshot without credentials."""
+        metadata: Dict[str, Any] = {}
+        config: Dict[str, Any] = {}
+        getter = getattr(self.model, "get_config", None)
+        if callable(getter):
+            try:
+                candidate = getter() or {}
+                if isinstance(candidate, dict):
+                    config = candidate
+            except Exception:
+                config = {}
+        model_name = (
+            config.get("model")
+            or config.get("model_name")
+            or getattr(self.model, "model", None)
+        )
+        provider_name = config.get("provider") or config.get("type")
+        if not provider_name and self.model is not None:
+            provider_name = type(self.model).__name__
+        if model_name:
+            metadata["model"] = str(model_name)[:240]
+        if provider_name:
+            metadata["provider"] = str(provider_name)[:120]
+
+        response_getter = getattr(self.model, "get_last_response_metadata", None)
+        if callable(response_getter):
+            try:
+                from ..observability.models import LastResponseMetadata
+
+                response_metadata = response_getter() or {}
+                if isinstance(response_metadata, LastResponseMetadata):
+                    response_metadata = response_metadata.model_dump(exclude_none=True)
+                metadata.update(
+                    LastResponseMetadata.model_validate(response_metadata).model_dump(
+                        exclude_none=True
+                    )
+                )
+            except Exception:
+                logger.debug("Provider returned invalid response metadata")
+
+        usage_getter = getattr(self.model, "get_last_usage", None)
+        if callable(usage_getter):
+            try:
+                usage = usage_getter() or {}
+            except Exception:
+                usage = {}
+            if isinstance(usage, dict):
+                field_map = {
+                    "prompt_tokens": "input_tokens",
+                    "input_tokens": "input_tokens",
+                    "completion_tokens": "output_tokens",
+                    "output_tokens": "output_tokens",
+                    "cached_tokens": "cached_tokens",
+                    "cache_read_input_tokens": "cached_tokens",
+                    "total_tokens": "total_tokens",
+                }
+                for source, target in field_map.items():
+                    value = usage.get(source)
+                    if value is None or target in metadata:
+                        continue
+                    if isinstance(value, (int, float)):
+                        metadata[target] = value
+        return metadata
+
+    def _start_model_trace(self, *, iteration: int, stage: str) -> tuple[str, float]:
+        span_id = str(uuid.uuid4())
+        self._current_parent_span_id = span_id
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "model_call",
+                "title": "Model call",
+                "trace_id": f"model:{span_id}:call",
+                "span_id": span_id,
+                "parent_span_id": self._current_root_trace_id,
+                "iteration": iteration,
+                "stage": stage,
+                "status": "started",
+                "content": "",
+                **{
+                    key: value
+                    for key, value in self._model_trace_metadata().items()
+                    if key in {"model", "provider", "max_output_tokens"}
+                },
+            },
+        )
+        return span_id, time.perf_counter()
+
+    def _finish_model_trace(
+        self,
+        span_id: str,
+        started_at: float,
+        *,
+        iteration: int,
+        stage: str,
+        error: Optional[BaseException] = None,
+        duration_ms: Optional[float] = None,
+        response_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        model_metadata = self._model_trace_metadata()
+        if error:
+            # Optional providers may retain usage from their previous response.
+            model_metadata = {
+                key: value
+                for key, value in model_metadata.items()
+                if key in {"model", "provider", "max_output_tokens"}
+            }
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "model_result",
+                "title": "Model result",
+                "trace_id": f"model:{span_id}:result",
+                "span_id": span_id,
+                "parent_span_id": self._current_root_trace_id,
+                "iteration": iteration,
+                "stage": stage,
+                "status": "error" if error else "success",
+                "success": error is None,
+                "error_code": type(error).__name__ if error else "",
+                "duration_ms": round(
+                    duration_ms
+                    if duration_ms is not None
+                    else (time.perf_counter() - started_at) * 1000,
+                    3,
+                ),
+                "content": "",
+                **model_metadata,
+                **(response_metadata or {}),
+            },
+        )
+        self._current_parent_span_id = self._current_root_trace_id
+
+    def _generate_with_trace(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]],
+        iteration: int,
+        stage: str,
+    ) -> Any:
+        span_id, started_at = self._start_model_trace(iteration=iteration, stage=stage)
+        error: Optional[BaseException] = None
+        response_metadata = {}
+        try:
+            response = self.model.generate(messages, tools=tools)
+            from ..llms.response_metadata import response_metadata as describe_response
+
+            response_metadata = describe_response(
+                response, text=response if isinstance(response, str) else None
+            )
+            return response
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            self._finish_model_trace(
+                span_id,
+                started_at,
+                iteration=iteration,
+                stage=stage,
+                error=error,
+                response_metadata=response_metadata,
+            )
+
+    def _generate_stream_with_trace(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]],
+        iteration: int,
+        stage: str,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Yield provider events while measuring only time spent in the provider."""
+        span_id, started_at = self._start_model_trace(iteration=iteration, stage=stage)
+        provider_duration_ms = 0.0
+        response_chars = response_bytes = 0
+        ttft_ms = None
+        terminal_received = False
+        stream = None
+        error: Optional[BaseException] = None
+        try:
+            stream = iter(self.model.generate_stream(messages, tools=tools))
+            while True:
+                check_cancelled()
+                next_started_at = time.perf_counter()
+                try:
+                    event = next(stream)
+                except StopIteration:
+                    provider_duration_ms += (
+                        time.perf_counter() - next_started_at
+                    ) * 1000
+                    break
+                except BaseException:
+                    provider_duration_ms += (
+                        time.perf_counter() - next_started_at
+                    ) * 1000
+                    raise
+                provider_duration_ms += (time.perf_counter() - next_started_at) * 1000
+                if event.get("type") == "content" and isinstance(
+                    event.get("content"), str
+                ):
+                    response_chars += len(event["content"])
+                    response_bytes += len(event["content"].encode("utf-8"))
+                    if ttft_ms is None:
+                        ttft_ms = provider_duration_ms
+                        session = session_for(self)
+                        if session is not None:
+                            session.emit(
+                                "status",
+                                stage="provider_first_delta",
+                                span_id=span_id,
+                                attempt=iteration,
+                                provider_ttft_ms=round(ttft_ms, 3),
+                            )
+                if event.get("type") in {"done", "tool_calls"}:
+                    terminal_received = True
+                yield event
+        except GeneratorExit:
+            # A consumer returning after the provider's terminal event closes
+            # this wrapper at its yield point; that is a successful model call.
+            if not terminal_received:
+                error = GeneratorExit()
+            raise
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            if stream is not None and callable(getattr(stream, "close", None)):
+                try:
+                    stream.close()
+                except Exception as close_error:
+                    if error is None:
+                        error = close_error
+            self._finish_model_trace(
+                span_id,
+                started_at,
+                iteration=iteration,
+                stage=stage,
+                error=error,
+                duration_ms=provider_duration_ms,
+                response_metadata={
+                    **(getattr(error, "response_metadata", {}) or {}),
+                    "response_chars": response_chars,
+                    "response_bytes": response_bytes,
+                    "stream_duration_ms": round(provider_duration_ms, 3),
+                    **({"ttft_ms": round(ttft_ms, 3)} if ttft_ms is not None else {}),
+                },
+            )
 
     def run(
         self,
@@ -3257,6 +4940,7 @@ class MemAgent:
         user_id: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
         tool_context: Optional[Dict[str, Any]] = None,
+        observability_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Run the agent with the given query using the new manager architecture.
@@ -3296,10 +4980,42 @@ class MemAgent:
                 loop and reset when the call returns. Use it for per-request
                 facts the LLM should not see or be required to pass
                 (e.g. ``{"user_id": "..."}`` for tenant-scoped tool queries).
+            observability_context: Optional content-free host provenance for
+                the private trace bundle. Only a strict allowlist of routing,
+                ownership, grounding, and fingerprint fields is retained; this
+                dict is never sent to the LLM or conversation history.
 
         Returns:
             The agent's response
         """
+        if (
+            self.meta_harness is not None
+            and self.meta_harness_mode == "runtime"
+            and not (tool_context or {}).get("_memorizz_harness_native")
+        ):
+            result = self.run_on_harness(
+                query,
+                workspace=(tool_context or {}).get("workspace")
+                or (context or {}).get("workspace"),
+                memory_id=memory_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                context=context,
+                write=(tool_context or {}).get("harness_write"),
+                verification_command=(tool_context or {}).get(
+                    "harness_verification_command"
+                ),
+                execution_backend=(tool_context or {}).get("harness_execution_backend"),
+            )
+            if session_for(self) is not None and result.status.value != "succeeded":
+                from ..llms.streaming import ProviderStreamError
+
+                raise ProviderStreamError("harness_" + str(result.status.value))
+            return (
+                result.final_response
+                if result.status.value == "succeeded"
+                else json.dumps(result.to_dict(), ensure_ascii=False, default=str)
+            )
         if (
             self.delegates
             and self.delegation_config.get("enabled", True)
@@ -3321,19 +5037,41 @@ class MemAgent:
         from ..tool_context import reset_tool_context, set_tool_context
 
         _tc_token = set_tool_context(tool_context or {})
+        trace_initialized = False
+        turn_status = "error"
+        turn_error_code: Optional[str] = None
 
         try:
             # 1. Prepare IDs with per-thread state isolation.
             memory_id, thread_id = self._resolve_execution_state(memory_id, thread_id)
-            self._current_user_id = user_id
+            self._begin_trace_turn(user_id, query=query)
+            trace_initialized = True
+            self._emit_context_provenance_trace(observability_context, context)
             self._turn_had_side_effects = False
             self._turn_had_nondeterministic_tools = False
             self._turn_cache_domains = set()
             self._cache_bypass_reason = None
+            self._last_completion_decisions = []
             cache_metadata = self._semantic_cache_metadata(context)
             cache_lookup_bypass = self._semantic_cache_preflight_bypass(
                 query, user_id=user_id
             )
+            if not self.cache_manager.enabled:
+                self._emit_cache_decision_trace("disabled", cache_metadata)
+            elif cache_lookup_bypass:
+                self._emit_cache_decision_trace(
+                    "bypassed", cache_metadata, bypass_reason=cache_lookup_bypass
+                )
+            if cache_lookup_bypass and self.learning_control_plane is not None:
+                try:
+                    self.learning_control_plane.record_cache(
+                        hit=False,
+                        query=query,
+                        reason=cache_lookup_bypass,
+                        scope=self._trace_identity_payload(),
+                    )
+                except Exception:
+                    pass
 
             # 2. Check semantic cache first
             cached_response = None
@@ -3345,19 +5083,64 @@ class MemAgent:
                     metadata=cache_metadata,
                     bypass_reason=cache_lookup_bypass,
                 )
-                if cached_response:
-                    logger.info("Returning cached response")
-                    self._record_interaction(
-                        query,
-                        cached_response,
-                        memory_id,
-                        thread_id,
-                        user_id=user_id,
+                if not cache_lookup_bypass:
+                    self._emit_cache_decision_trace(
+                        "hit" if cached_response else "miss", cache_metadata
                     )
-                    return cached_response
+                if cached_response:
+                    # Cache lookup is not an authorization boundary. Re-run
+                    # host completion validation so changing runtime policy,
+                    # external acceptance state, or a trusted validator cannot
+                    # be bypassed by a response accepted on an earlier turn.
+                    cache_decision = self._evaluate_completion_candidate(
+                        query=query,
+                        response=cached_response,
+                        iteration=0,
+                        tool_call_count=0,
+                    )
+                    if cache_decision.accepted:
+                        logger.info("Returning host-validated cached response")
+                        if self.learning_control_plane is not None:
+                            try:
+                                self.learning_control_plane.record_cache(
+                                    hit=True,
+                                    query=query,
+                                    reason="exact_or_semantic_cache_hit",
+                                    scope=self._trace_identity_payload(),
+                                )
+                            except Exception:
+                                pass
+                        self._record_interaction(
+                            query,
+                            cached_response,
+                            memory_id,
+                            thread_id,
+                            user_id=user_id,
+                        )
+                        turn_status = "success"
+                        return cached_response
+                    logger.info(
+                        "Cached response rejected by completion policy (%s); "
+                        "continuing with a fresh model turn",
+                        cache_decision.code,
+                    )
+                    self._emit_cache_decision_trace(
+                        "rejected",
+                        cache_metadata,
+                        bypass_reason=cache_decision.code,
+                    )
 
             # 3. Build context and prompt
-            built_context = self._build_context(query, memory_id, user_id=user_id)
+            built_context = self._build_context(
+                query,
+                memory_id,
+                user_id=user_id,
+                include_entity_memory=not self._host_owns_entity_personalization(
+                    context
+                ),
+            )
+            built_context = self._attach_personalization_context(built_context, context)
+            self._emit_memory_context_trace(built_context)
             system_prompt = self._build_system_prompt()
 
             # 4. Execute with LLM
@@ -3368,6 +5151,12 @@ class MemAgent:
                 user_id=user_id,
                 request_context=context,
             )
+            check_cancelled()
+            stream_session = session_for(self)
+            if stream_session is not None and stream_session.outcome != "completed":
+                turn_status = stream_session.outcome
+                return ""
+            self._emit_memory_reference_trace(response)
 
             # 5. Cache the response
             if self.cache_manager.enabled:
@@ -3388,13 +5177,31 @@ class MemAgent:
             )
 
             logger.info(f"MemAgent {self.agent_id} completed successfully")
+            turn_status = "success"
             return response
 
+        except CompletionRejectedError:
+            turn_error_code = "CompletionRejectedError"
+            raise
         except Exception as e:
             logger.error(f"MemAgent execution failed: {e}")
+            turn_error_code = type(e).__name__
+            if session_for(self) is not None:
+                raise
             error_response = f"I apologize, but I encountered an error: {str(e)}"
             return error_response
         finally:
+            if trace_initialized:
+                self._finish_trace_turn(
+                    turn_status,
+                    error_code=turn_error_code,
+                )
+                self._record_stream_trace_bundle(
+                    memory_id,
+                    thread_id,
+                    user_id=user_id,
+                )
+                self._stream_trace_events = None
             # M4: always release the per-call tool_context scope.
             reset_tool_context(_tc_token)
 
@@ -3419,9 +5226,72 @@ class MemAgent:
 
         from ..multi_agent_orchestrator import MultiAgentOrchestrator
 
+        memory_id, thread_id = self._resolve_execution_state(memory_id, thread_id)
         configured_plan = (
             plan if plan is not None else self.delegation_config.get("plan")
         )
+        cache_context, cache_bypass_reason = self._delegation_cache_context(
+            context, configured_plan
+        )
+        cache_metadata = self._semantic_cache_metadata(cache_context)
+        if self.cache_manager.enabled:
+            cached_response = self.cache_manager.get_cached_response(
+                query,
+                thread_id,
+                user_id=user_id,
+                metadata=cache_metadata,
+                bypass_reason=cache_bypass_reason,
+            )
+            if cached_response:
+                cache_decision = self._evaluate_completion_candidate(
+                    query=query,
+                    response=cached_response,
+                    iteration=0,
+                    tool_call_count=0,
+                )
+                if not cache_decision.accepted:
+                    cached_response = None
+            if cached_response:
+                if self.learning_control_plane is not None:
+                    try:
+                        self.learning_control_plane.record_cache(
+                            hit=True,
+                            query=query,
+                            reason="verified_read_only_delegation_cache_hit",
+                            scope={
+                                "memory_id": memory_id,
+                                "thread_id": thread_id,
+                                "user_id": user_id,
+                            },
+                        )
+                    except Exception:
+                        pass
+                self._record_interaction(
+                    query,
+                    cached_response,
+                    memory_id,
+                    thread_id,
+                    user_id=user_id,
+                )
+                if return_report:
+                    return {
+                        "ok": True,
+                        "partial": False,
+                        "cached": True,
+                        "workflow_id": None,
+                        "trace_id": trace_id,
+                        "user_id": user_id,
+                        "response": cached_response,
+                        "consolidation": {
+                            "status": "succeeded",
+                            "strategy": "semantic_cache",
+                            "model_used": False,
+                        },
+                        "tasks": [],
+                        "failures": [],
+                    }
+                return cached_response
+
         inherited_workflow_id = (
             str((tool_context or {}).get("workflow_id") or "").strip() or None
         )
@@ -3438,8 +5308,21 @@ class MemAgent:
             workflow_id=(
                 self.delegation_config.get("workflow_id") or inherited_workflow_id
             ),
+            consolidation_strategy=self.delegation_config.get(
+                "consolidation_strategy", "model"
+            ),
+            primary_task_id=self.delegation_config.get("primary_task_id"),
+            evidence_context=self.delegation_config.get("evidence_context", True),
+            max_dependency_context_chars=self.delegation_config.get(
+                "max_dependency_context_chars", 12_000
+            ),
+            max_consolidation_result_chars=self.delegation_config.get(
+                "max_consolidation_result_chars", 12_000
+            ),
+            required_finding_ids=self.delegation_config.get("required_finding_ids", []),
+            adaptive_escalation=self.delegation_config.get("adaptive_escalation", {}),
         )
-        return orchestrator.execute_multi_agent_workflow(
+        result = orchestrator.execute_multi_agent_workflow(
             query,
             memory_id,
             thread_id,
@@ -3450,6 +5333,149 @@ class MemAgent:
             delegation_plan=configured_plan,
             return_report=return_report,
         )
+        response = (
+            str(result.get("response") or "")
+            if isinstance(result, dict)
+            else str(result or "")
+        )
+        workflow_report = (
+            dict(result)
+            if isinstance(result, dict)
+            else dict(orchestrator.last_workflow_report or {})
+        )
+        workflow_ok = bool(workflow_report.get("ok", not workflow_report))
+        if response and workflow_ok:
+            if self.cache_manager.enabled and cache_bypass_reason is None:
+                self.cache_manager.cache_response(
+                    query,
+                    response,
+                    thread_id,
+                    user_id=user_id,
+                    metadata=cache_metadata,
+                    deterministic=True,
+                    read_only=True,
+                )
+            self._record_interaction(
+                query, response, memory_id, thread_id, user_id=user_id
+            )
+        self._record_delegation_learning(
+            query=query,
+            response=response,
+            result=workflow_report or result,
+            memory_id=memory_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            cache_bypass_reason=cache_bypass_reason,
+        )
+        return result
+
+    def _delegation_cache_context(
+        self,
+        context: Optional[Dict[str, Any]],
+        configured_plan: Any,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Return cache identity and a fail-closed delegation admission reason."""
+        value = dict(context or {})
+        value.setdefault("cache_domain", "delegation")
+        data_version = value.get("cache_data_version") or value.get("data_version")
+        delegation_identity = {
+            "plan": configured_plan,
+            "configuration": self.delegation_config,
+            "delegates": [
+                {
+                    "agent_id": delegate.agent_id,
+                    "instruction": delegate.instruction,
+                    "mode": getattr(delegate, "meta_harness_mode", None),
+                    "harness": getattr(delegate, "default_harness", None),
+                    "harness_config": getattr(delegate, "harness_config", None),
+                }
+                for delegate in self.delegates
+            ],
+        }
+        value["delegation_fingerprint"] = self._fingerprint(delegation_identity)
+        if not self.cache_manager.enabled:
+            return value, "semantic_cache_disabled"
+        if self.completion_policy.enabled and self.completion_policy.require_tool_calls:
+            return value, "completion_policy_requires_fresh_tool_evidence"
+        if self.delegation_config.get("mode") != "deterministic" or callable(
+            configured_plan
+        ):
+            return value, "nondeterministic_delegation_plan"
+        if not data_version:
+            return value, "delegation_data_version_required"
+
+        from ..metaharness import HarnessPermissions, VerificationSpec
+
+        for delegate in self.delegates:
+            if getattr(delegate, "meta_harness_mode", None) != "runtime":
+                return value, "native_delegate_not_cacheable"
+            config = dict(getattr(delegate, "harness_config", None) or {})
+            permissions = HarnessPermissions.from_value(config.get("permissions"))
+            verification = VerificationSpec.from_value(config.get("verification"))
+            if (
+                permissions.workspace_mode != "read_only"
+                or permissions.network != "none"
+                or permissions.mcp_access == "governed_write"
+            ):
+                return value, "side_effecting_delegation"
+            if not verification.required:
+                return value, "unverified_delegation"
+        value["data_version"] = str(data_version)
+        return value, None
+
+    def _record_delegation_learning(
+        self,
+        *,
+        query: str,
+        response: str,
+        result: Any,
+        memory_id: str,
+        thread_id: str,
+        user_id: Optional[str],
+        cache_bypass_reason: Optional[str],
+    ) -> None:
+        """Capture the coordinated workflow as one continual-learning outcome."""
+        if self.learning_control_plane is None:
+            return
+        report = dict(result) if isinstance(result, dict) else {}
+        workflow_id = str(report.get("workflow_id") or uuid.uuid4())
+        ok = not report or bool(report.get("ok"))
+        scope = {
+            "memory_id": memory_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "workflow_id": workflow_id,
+            "trace_id": report.get("trace_id"),
+            "run_id": workflow_id,
+        }
+        try:
+            self.learning_control_plane.begin_run(query, scope=scope)
+            self.learning_control_plane.complete_run(
+                response,
+                status="success" if ok else "failure",
+                metrics={
+                    "task_count": len(report.get("tasks") or []),
+                    "failure_count": len(report.get("failures") or []),
+                    "consolidation": dict(report.get("consolidation") or {}),
+                    "cache_bypass_reason": cache_bypass_reason,
+                },
+                scope=scope,
+            )
+            self.learning_control_plane.record_workflow(
+                workflow_id=workflow_id,
+                outcome="success" if ok else "failure",
+                canonical_hash=self._fingerprint(
+                    {
+                        "query": query,
+                        "delegation": self.delegation_config,
+                    }
+                ),
+                step_count=len(report.get("tasks") or []),
+                skills_activated=[],
+                scope=scope,
+            )
+        except Exception:
+            logger.debug("Delegation learning capture failed", exc_info=True)
 
     def list_approval_proposals(
         self, *, status: Optional[Union[ApprovalStatus, str]] = None, limit: int = 100
@@ -3630,7 +5656,12 @@ class MemAgent:
         self._set_provider_cache_scope()
         try:
             for iteration in range(self._get_tool_iteration_limit()):
-                response = self.model.generate(_to_jsonable(messages), tools=tools)
+                response = self._generate_with_trace(
+                    _to_jsonable(messages),
+                    tools=tools,
+                    iteration=iteration + 1,
+                    stage="approval_resume",
+                )
                 self._record_context_window_usage(
                     stage=f"approval_resume_{iteration + 1}"
                 )
@@ -3684,6 +5715,27 @@ class MemAgent:
             consumed=True,
         )
 
+    def run_stream_events(
+        self, query, *, delivery_mode=None, cancellation=None, queue_size=64, **kwargs
+    ):
+        """Return a closeable, ordered v1 event stream (no private reasoning)."""
+        from ..streaming import agent_event_stream
+
+        return agent_event_stream(
+            self,
+            query,
+            delivery_mode=delivery_mode,
+            cancellation=cancellation,
+            queue_size=queue_size,
+            **kwargs,
+        )
+
+    async def arun_stream_events(self, query, **kwargs):
+        """Async event iterator backed by one owned execution context/worker."""
+        stream = self.run_stream_events(query, **kwargs)
+        async for event in stream.async_events():
+            yield event
+
     def run_stream(
         self,
         query: str,
@@ -3693,6 +5745,8 @@ class MemAgent:
         context: Optional[Dict[str, Any]] = None,
         tool_context: Optional[Dict[str, Any]] = None,
         raise_on_provider_error: bool = False,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        observability_context: Optional[Dict[str, Any]] = None,
     ) -> Generator[str, None, None]:
         """
         Run the agent with streaming output, yielding text chunks as they arrive.
@@ -3716,11 +5770,32 @@ class MemAgent:
             raise_on_provider_error: Re-raise LLM/provider API failures after
                 emitting typed terminal events. Defaults to ``False`` for
                 compatibility with UI streams that render inline failures.
+            event_callback: Optional callback scoped to this stream only. This
+                is concurrency-safe and preferred over mutating a shared agent
+                with ``set_stream_event_callback`` immediately before a run.
+            observability_context: Optional content-free host provenance. See
+                ``run()``; the same strict persistence allowlist applies.
 
         Yields:
             str: Partial text chunks of the agent's response
         """
         logger.info(f"MemAgent {self.agent_id} streaming query: {query[:50]}...")
+
+        if (
+            self.meta_harness is not None
+            and self.meta_harness_mode == "runtime"
+            and not (tool_context or {}).get("_memorizz_harness_native")
+        ):
+            yield self.run(
+                query,
+                memory_id=memory_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                context=context,
+                tool_context=tool_context,
+                observability_context=observability_context,
+            )
+            return
 
         if (
             self.delegates
@@ -3739,7 +5814,13 @@ class MemAgent:
             yield serialize_tool_result(result)
             return
 
-        if not self.model or not hasattr(self.model, "generate_stream"):
+        from ..llms.streaming import streaming_capabilities
+
+        if self.model is None and session_for(self) is not None:
+            from ..llms.streaming import ProviderStreamError
+
+            raise ProviderStreamError("model_not_configured")
+        if not self.model or not streaming_capabilities(self.model)["text_deltas"]:
             # Fallback: run synchronously and yield the full result
             yield self.run(
                 query,
@@ -3748,6 +5829,7 @@ class MemAgent:
                 user_id=user_id,
                 context=context,
                 tool_context=tool_context,
+                observability_context=observability_context,
             )
             return
 
@@ -3755,33 +5837,59 @@ class MemAgent:
         from ..tool_context import reset_tool_context, set_tool_context
 
         _tc_token = set_tool_context(tool_context or {})
-
-        # M3: lifecycle event so the consumer (e.g. an SSE translator) can
-        # render "thinking…" indicators immediately, before any text chunk.
-        self._emit_stream_event(
-            "stream_start",
-            {
-                "agent_id": self.agent_id,
-                "memory_id": memory_id,
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "has_request_context": bool(context),
-            },
-        )
-
-        self._stream_trace_events = []
+        previous_event_callback = self._stream_event_callback
+        if event_callback is not None:
+            self._stream_event_callback = event_callback
+        trace_initialized = False
+        trace_finished = False
+        turn_status = "error"
+        turn_error_code: Optional[str] = None
+        session = session_for(self)
         try:
+            check_cancelled()
             # 1. Prepare IDs with per-thread state isolation.
             memory_id, thread_id = self._resolve_execution_state(memory_id, thread_id)
-            self._current_user_id = user_id
+            self._begin_trace_turn(user_id, query=query, emit_start=False)
+            trace_initialized = True
+            # M3: the lifecycle event is emitted after ID resolution so every
+            # callback receives the same durable identity as persisted spans.
+            self._emit_stream_event(
+                "stream_start",
+                {
+                    "agent_id": self.agent_id,
+                    "memory_id": memory_id,
+                    "thread_id": thread_id,
+                    "user_id": user_id,
+                    "has_request_context": bool(context),
+                },
+            )
+            self._emit_trace_turn_start()
+            self._emit_context_provenance_trace(observability_context, context)
             self._turn_had_side_effects = False
             self._turn_had_nondeterministic_tools = False
             self._turn_cache_domains = set()
             self._cache_bypass_reason = None
+            self._last_completion_decisions = []
             cache_metadata = self._semantic_cache_metadata(context)
             cache_lookup_bypass = self._semantic_cache_preflight_bypass(
                 query, user_id=user_id
             )
+            if not self.cache_manager.enabled:
+                self._emit_cache_decision_trace("disabled", cache_metadata)
+            elif cache_lookup_bypass:
+                self._emit_cache_decision_trace(
+                    "bypassed", cache_metadata, bypass_reason=cache_lookup_bypass
+                )
+            if cache_lookup_bypass and self.learning_control_plane is not None:
+                try:
+                    self.learning_control_plane.record_cache(
+                        hit=False,
+                        query=query,
+                        reason=cache_lookup_bypass,
+                        scope=self._trace_identity_payload(),
+                    )
+                except Exception:
+                    pass
 
             # 2. Check semantic cache first
             if self.cache_manager.enabled:
@@ -3792,20 +5900,68 @@ class MemAgent:
                     metadata=cache_metadata,
                     bypass_reason=cache_lookup_bypass,
                 )
+                if not cache_lookup_bypass:
+                    self._emit_cache_decision_trace(
+                        "hit" if cached else "miss", cache_metadata
+                    )
                 if cached:
-                    self._record_interaction(
-                        query, cached, memory_id, thread_id, user_id=user_id
+                    cache_decision = self._evaluate_completion_candidate(
+                        query=query,
+                        response=cached,
+                        iteration=0,
+                        tool_call_count=0,
                     )
-                    self._emit_stream_event(
-                        "stream_end",
-                        {"reason": "cache_hit", "agent_id": self.agent_id},
+                    if cache_decision.accepted:
+                        yield cached
+                        if session:
+                            session.answer_done()
+                        check_cancelled()
+                        if self.learning_control_plane is not None:
+                            try:
+                                self.learning_control_plane.record_cache(
+                                    hit=True,
+                                    query=query,
+                                    reason="exact_or_semantic_cache_hit",
+                                    scope=self._trace_identity_payload(),
+                                )
+                            except Exception:
+                                pass
+                        self._record_interaction(
+                            query, cached, memory_id, thread_id, user_id=user_id
+                        )
+                        turn_status = "success"
+                        self._finish_trace_turn(turn_status)
+                        trace_finished = True
+                        self._emit_stream_event(
+                            "stream_end",
+                            {"reason": "cache_hit", "agent_id": self.agent_id},
+                        )
+                        return
+                    logger.info(
+                        "Cached stream response rejected by completion policy "
+                        "(%s); continuing with a fresh model turn",
+                        cache_decision.code,
                     )
-                    yield cached
-                    return
+                    self._emit_cache_decision_trace(
+                        "rejected",
+                        cache_metadata,
+                        bypass_reason=cache_decision.code,
+                    )
 
             # 3. Build context and prompt
-            built_context = self._build_context(query, memory_id, user_id=user_id)
+            built_context = self._build_context(
+                query,
+                memory_id,
+                user_id=user_id,
+                include_entity_memory=not self._host_owns_entity_personalization(
+                    context
+                ),
+            )
+            built_context = self._attach_personalization_context(built_context, context)
+            self._emit_memory_context_trace(built_context)
             system_prompt = self._build_system_prompt()
+            if session:
+                session.emit("status", stage="context_ready")
 
             # 4. Stream the LLM interaction
             full_response = ""
@@ -3818,9 +5974,19 @@ class MemAgent:
             ):
                 full_response += chunk
                 yield chunk
+            if session and session.outcome != "completed":
+                turn_status = session.outcome
+                turn_error_code = session.error_code
+                return
+            check_cancelled()
+            if session:
+                session.answer_done()
+            self._emit_memory_reference_trace(full_response)
 
             # 5. Cache the response
             if self.cache_manager.enabled:
+                if session:
+                    session.persistence["cache"] = "unknown"
                 self.cache_manager.cache_response(
                     query,
                     full_response,
@@ -3836,7 +6002,9 @@ class MemAgent:
             self._record_interaction(
                 query, full_response, memory_id, thread_id, user_id=user_id
             )
-            self._record_stream_trace_bundle(memory_id, thread_id, user_id=user_id)
+            turn_status = "success"
+            self._finish_trace_turn(turn_status)
+            trace_finished = True
             self._emit_stream_event(
                 "stream_end",
                 {
@@ -3846,6 +6014,9 @@ class MemAgent:
                 },
             )
 
+        except StreamCancelled:
+            turn_status, turn_error_code = "cancelled", "cancelled"
+            raise
         except Exception as e:
             # Include full traceback so we can pinpoint which step in the
             # streaming pipeline failed (LOB-serialization bugs surface here
@@ -3863,6 +6034,10 @@ class MemAgent:
                 if is_provider_error
                 else "stream_error"
             )
+            turn_error_code = error_code
+            if trace_initialized:
+                self._finish_trace_turn("error", error_code=turn_error_code)
+                trace_finished = True
             self._emit_stream_event(
                 "error",
                 {
@@ -3883,11 +6058,28 @@ class MemAgent:
                     "agent_id": self.agent_id,
                 },
             )
+            if isinstance(e, CompletionRejectedError):
+                raise
+            if session:
+                raise
             if raise_on_provider_error and is_provider_error:
                 raise
             yield f"I apologize, but I encountered an error: {str(e)}"
         finally:
+            if trace_initialized:
+                if not trace_finished:
+                    self._finish_trace_turn(
+                        turn_status,
+                        error_code=turn_error_code,
+                    )
+                self._record_stream_trace_bundle(
+                    memory_id,
+                    thread_id,
+                    user_id=user_id,
+                )
             self._stream_trace_events = None
+            if event_callback is not None:
+                self._stream_event_callback = previous_event_callback
             # M4: always release the per-call tool_context scope.
             reset_tool_context(_tc_token)
 
@@ -3918,6 +6110,7 @@ class MemAgent:
         stream_end    ``reason`` (``completed``/``cache_hit``/``error``),
                       ``agent_id``, optional ``response_length``. Fired once
                       when the stream terminates.
+        completion_check  Candidate acceptance, code, digest and attempt evidence.
         ============  =================================================================
 
         Text chunks themselves are yielded by the generator, not surfaced via
@@ -3935,20 +6128,27 @@ class MemAgent:
 
         See :meth:`set_stream_event_callback` for the full event taxonomy.
         """
+        enriched_payload = dict(payload or {})
+        if self._current_root_trace_id:
+            for key, value in self._trace_identity_payload().items():
+                enriched_payload.setdefault(key, value)
+
         if event_type == "trace" and self._stream_trace_events is not None:
-            if isinstance(payload, dict):
-                self._stream_trace_events.append(dict(payload))
+            self._stream_trace_events.append(dict(enriched_payload))
 
         callback = self._stream_event_callback
         if not callback:
             return
         event: Dict[str, Any] = {"type": event_type}
-        if payload:
-            event.update(payload)
+        if enriched_payload:
+            event.update(enriched_payload)
         try:
             callback(event)
         except Exception as exc:
-            logger.debug("Stream event callback failed: %s", exc)
+            from ..observability.pipeline import record_pipeline_metric
+
+            record_pipeline_metric(self.memory_provider, "callback_failures")
+            logger.debug("Stream event callback failed (%s)", type(exc).__name__)
 
     def _preview_stream_payload(self, value: Any, limit: int = 1800) -> str:
         """Serialize arbitrary event data into a bounded preview string."""
@@ -4006,13 +6206,96 @@ class MemAgent:
 
     def _build_trace_bundle_events(
         self, events: Optional[List[Dict[str, Any]]]
-    ) -> List[Dict[str, str]]:
+    ) -> List[Dict[str, Any]]:
         """Normalize and compact streamed trace events for persistence."""
         if not events:
             return []
 
-        normalized: List[Dict[str, str]] = []
-        by_trace_id: Dict[str, Dict[str, str]] = {}
+        normalized: List[Dict[str, Any]] = []
+        by_trace_id: Dict[str, Dict[str, Any]] = {}
+        # Keep a deliberately bounded set of structured attributes. These are
+        # needed for reliable analysis in the UI, while arbitrary callback
+        # payloads must not become an accidental persistence channel.
+        metadata_fields = (
+            "schema_version",
+            "application_id",
+            "agent_id",
+            "run_id",
+            "turn_id",
+            "root_trace_id",
+            "span_id",
+            "parent_span_id",
+            "memory_id",
+            "thread_id",
+            "user_id",
+            "timestamp",
+            "tool_name",
+            "logical_tool_name",
+            "model_tool_name",
+            "tool_call_id",
+            "success",
+            "status",
+            "outcome",
+            "outcome_reason_code",
+            "tool_provider",
+            "primary_provider",
+            "fallback_provider",
+            "outcome_retryable",
+            "result_count",
+            "fallback_used",
+            "degraded",
+            "error_code",
+            "duration_ms",
+            "model",
+            "provider",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "cost_usd",
+            "finish_reason",
+            "max_output_tokens",
+            "response_chars",
+            "response_bytes",
+            "ttft_ms",
+            "stream_duration_ms",
+            "retry_count",
+            "fallback_count",
+            "iteration",
+            "stage",
+            "total_tokens",
+            "request_id",
+            "client_page_type",
+            "client_page_id",
+            "client_title_fingerprint",
+            "canonical_page_type",
+            "canonical_page_id",
+            "canonical_title_fingerprint",
+            "thread_binding_status",
+            "expected_thread_id",
+            "ownership_verified",
+            "request_context_present",
+            "request_context_fingerprint",
+            "request_context_key_count",
+            "content_version",
+            "grounding_status",
+            "grounding_source",
+            "grounding_excerpt_count",
+            "grounding_source_ids",
+            "cache_decision",
+            "memory_history_count",
+            "memory_candidate_count",
+            "memory_supplied_count",
+            "memory_referenced_count",
+            "memory_injected_chars",
+            "memory_degraded",
+            "memory_fallback_used",
+            "entity_profile_count",
+            "preference_count",
+            "conversation_memory_count",
+            "writing_sample_count",
+            "cache_enabled",
+            "cache_bypass_reason",
+        )
 
         for event in events:
             if not isinstance(event, dict):
@@ -4041,6 +6324,37 @@ class MemAgent:
             if trace_id:
                 entry["trace_id"] = trace_id
                 by_trace_id[trace_id] = entry
+            from ..observability.models import ResourceRef, SelectionDecision
+
+            for field, model, maximum in (
+                ("selection_ledger", SelectionDecision, 64),
+                ("input_refs", ResourceRef, 32),
+                ("output_refs", ResourceRef, 32),
+            ):
+                if isinstance(event.get(field), list):
+                    try:
+                        entry[field] = [
+                            model.model_validate(value).model_dump(
+                                mode="json", exclude_none=True
+                            )
+                            for value in event[field][:maximum]
+                        ]
+                    except ValueError:
+                        from ..observability.pipeline import record_pipeline_metric
+
+                        record_pipeline_metric(
+                            self.memory_provider, "dropped_metadata_fields"
+                        )
+            for field in metadata_fields:
+                value = event.get(field)
+                if field == "grounding_source_ids" and isinstance(value, (list, tuple)):
+                    entry[field] = [
+                        item[:240] for item in value[:16] if isinstance(item, str)
+                    ]
+                    continue
+                if value is None or not isinstance(value, (str, int, float, bool)):
+                    continue
+                entry[field] = value[:240] if isinstance(value, str) else value
             normalized.append(entry)
 
         return [item for item in normalized if item.get("title") or item.get("content")]
@@ -4051,8 +6365,20 @@ class MemAgent:
         thread_id: str,
         user_id: Optional[str] = None,
     ) -> None:
-        """Persist streamed reasoning/tool traces for later Playground reloads."""
-        if not self.memory_manager:
+        """Persist reasoning/tool traces outside the conversational recall path."""
+        session = session_for(self)
+        if not self.memory_provider:
+            if session:
+                session.persistence["trace"] = "not_configured"
+            return
+        # A handful of legacy provider-like integrations expose ``store`` but
+        # no way to list or query a memory type. Writing trace bundles there
+        # would create permanently unreadable data. Full MemoryProvider
+        # implementations always expose at least one of these read surfaces.
+        if not any(
+            callable(getattr(self.memory_provider, method_name, None))
+            for method_name in ("query_observability_records", "list_all")
+        ):
             return
 
         trace_events = self._build_trace_bundle_events(self._stream_trace_events)
@@ -4060,27 +6386,29 @@ class MemAgent:
             return
 
         try:
-            payload = {
-                "type": "trace_bundle",
-                "version": 1,
-                "events": trace_events,
+            from ..observability import ObservabilityStore
+
+            context = {
+                **self._trace_identity_payload(),
+                "memory_id": memory_id,
+                "thread_id": thread_id,
+                "user_id": user_id,
             }
-            trace_memory = self.memory_manager.create_conversation_memory_unit(
-                role=Role.TOOL,
-                content=json.dumps(payload, ensure_ascii=False),
-                thread_id=thread_id,
-                memory_id=memory_id,
-                agent_id=self.agent_id,
-                user_id=user_id,
+            ObservabilityStore(self.memory_provider).record_trace_bundle(
+                trace_context=context,
+                events=trace_events,
             )
-            self.memory_manager.save_memory_unit(trace_memory, memory_id)
+            if session:
+                session.persistence["trace"] = "written"
             logger.debug(
-                "Recorded streamed trace bundle in memory: %s events for thread %s",
+                "Recorded private trace bundle: %s events for thread %s",
                 len(trace_events),
-                memory_id,
+                thread_id,
             )
         except Exception as exc:
-            logger.warning(f"Failed to record streamed trace bundle: {exc}")
+            logger.warning("Failed to record trace bundle: %s", exc)
+            if session:
+                session.persistence["trace"] = "failed"
 
     def _format_recent_tool_logs_digest(self, limit: int = 10) -> str:
         """Build a compact, agent-facing digest of this thread's tool_log entries.
@@ -4107,7 +6435,7 @@ class MemAgent:
         except Exception as exc:
             logger.debug("Tool-log digest lookup failed: %s", exc)
             return ""
-        if not rows:
+        if not isinstance(rows, (list, tuple)) or not rows:
             return ""
         lines: List[str] = []
         for row in rows[:limit]:
@@ -4219,7 +6547,7 @@ class MemAgent:
         never drift between them. Learning hooks are fail-safe: they must
         never break a user-facing run.
         """
-        if not (workflow and workflow.steps):
+        if not (workflow and workflow.steps) or self.memory_provider is None:
             return False
         self._apply_workflow_outcome_evaluator(workflow)
         try:
@@ -4236,6 +6564,47 @@ class MemAgent:
                 self.continual_learning_manager.maybe_run_scheduled_cycle()
             except Exception as exc:
                 logger.error("Continual-learning post-run hook failed: %s", exc)
+        if self.learning_control_plane is not None:
+            try:
+                outcome_value = getattr(
+                    getattr(workflow, "outcome", None), "value", "unknown"
+                )
+                self.learning_control_plane.record_workflow(
+                    workflow_id=str(workflow.workflow_id),
+                    outcome=str(outcome_value),
+                    canonical_hash=getattr(workflow, "canonical_hash", None),
+                    step_count=len(workflow.steps),
+                    skills_activated=list(
+                        getattr(workflow, "skills_activated", None) or []
+                    ),
+                    scope={
+                        **self._trace_identity_payload(),
+                        "workflow_id": str(workflow.workflow_id),
+                    },
+                )
+            except Exception as exc:
+                logger.debug("Learning workflow-event capture failed: %s", exc)
+        try:
+            outcome_value = getattr(getattr(workflow, "outcome", None), "value", None)
+            if outcome_value in {"success", "failure"}:
+                trace_context = self.get_trace_context()
+                trace_context["workflow_id"] = str(workflow.workflow_id)
+                self.record_task_outcome(
+                    outcome_value,
+                    # Without an application evaluator this is execution
+                    # health, not verified business success.
+                    verified=self.workflow_outcome_evaluator is not None,
+                    source=(
+                        "workflow_outcome_evaluator"
+                        if self.workflow_outcome_evaluator is not None
+                        else "tool_execution"
+                    ),
+                    metrics={"step_count": len(workflow.steps)},
+                    trace_context=trace_context,
+                    external_id=str(workflow.workflow_id),
+                )
+        except Exception as exc:
+            logger.debug("Workflow outcome trace linkage failed: %s", exc)
         return True
 
     def _apply_workflow_outcome_evaluator(self, workflow) -> None:
@@ -4304,9 +6673,14 @@ class MemAgent:
 
         Shared by the streaming and non-streaming loops so per-run
         enrichment (user scope, skill attribution) can never drift between
-        them.
+        them. A configured memory type alone is not a persistence backend:
+        provider-less agents must remain stateless and must not construct an
+        embedding-bearing Workflow that can never be stored.
         """
-        if MemoryType.WORKFLOW_MEMORY not in self.active_memory_types:
+        if (
+            self.memory_provider is None
+            or MemoryType.WORKFLOW_MEMORY not in self.active_memory_types
+        ):
             return None
         from ..long_term.procedural.workflow.workflow import Workflow
 
@@ -4405,9 +6779,8 @@ class MemAgent:
 
     @staticmethod
     def _tool_result_failed(value: Any) -> bool:
-        if isinstance(value, str):
-            return value.startswith("Error")
-        return isinstance(value, dict) and value.get("ok") is False
+        _payload, outcome = normalize_tool_result(value)
+        return not outcome.ok
 
     def _execute_and_record_tool_call(
         self,
@@ -4433,30 +6806,10 @@ class MemAgent:
         # host-driven tool execution both enter through this shared method and
         # must not rely on a prior model turn having populated the field.
         self._current_user_id = user_id
+        tool_started_at = time.perf_counter()
 
         tool_name = tool_call.function.name
         raw_arguments = tool_call.function.arguments
-
-        tool_trace_id = None
-        if streaming:
-            tool_trace_id = (
-                f"{tool_name}:{tool_call.id}"
-                if getattr(tool_call, "id", None)
-                else f"{tool_name}:{uuid.uuid4()}"
-            )
-            self._emit_stream_event(
-                "trace",
-                {
-                    "trace_kind": "tool_call",
-                    "title": f"Tool Call: {tool_name}",
-                    "tool_name": tool_name,
-                    "trace_id": f"call:{tool_trace_id}",
-                    "content": self._preview_stream_payload(
-                        raw_arguments or "{}",
-                        limit=1400,
-                    ),
-                },
-            )
 
         try:
             arguments = json.loads(raw_arguments)
@@ -4472,7 +6825,49 @@ class MemAgent:
         routed_call_hash: Optional[str] = None
         error_message: Optional[str] = None
         result: Any = None
+        tool_outcome: Optional[ToolOutcome] = None
         router = getattr(self, "semantic_tool_router", None)
+
+        # A routed model call is named ``invoke_tool``, but that transport name
+        # is not useful to application traces. Resolve the requested logical
+        # name before emitting the call event while retaining both fields for
+        # audit/debugging consumers.
+        if router is not None and model_tool_name == router.INVOCATION_TOOL:
+            requested_name = str(arguments.get("tool_name") or "").strip()
+            if requested_name:
+                logical_tool_name = router._resolve_name(requested_name)
+            nested_arguments = arguments.get("arguments")
+            if isinstance(nested_arguments, dict):
+                logical_arguments = nested_arguments
+
+        tool_trace_id = (
+            f"{model_tool_name}:{tool_call.id}"
+            if getattr(tool_call, "id", None)
+            else f"{model_tool_name}:{uuid.uuid4()}"
+        )
+        tool_span_id = str(uuid.uuid4())
+        tool_parent_span_id = (
+            self._current_parent_span_id or self._current_root_trace_id
+        )
+        self._emit_stream_event(
+            "trace",
+            {
+                "trace_kind": "tool_call",
+                "title": f"Tool Call: {logical_tool_name}",
+                "tool_name": logical_tool_name,
+                "logical_tool_name": logical_tool_name,
+                "model_tool_name": model_tool_name,
+                "tool_call_id": getattr(tool_call, "id", None),
+                "trace_id": f"call:{tool_trace_id}",
+                "span_id": tool_span_id,
+                "parent_span_id": tool_parent_span_id,
+                "status": "started",
+                "content": self._preview_stream_payload(
+                    logical_arguments,
+                    limit=1400,
+                ),
+            },
+        )
 
         if router is not None and model_tool_name == router.DISCOVERY_TOOL:
             result = router.discover_tools(
@@ -4562,6 +6957,28 @@ class MemAgent:
                         ttl_seconds=self.context_policy.approval_ttl_seconds,
                     )
                     self._cache_bypass_reason = "approval_required"
+                    self._emit_stream_event(
+                        "trace",
+                        {
+                            "trace_kind": "tool_result",
+                            "title": f"Tool paused: {logical_tool_name}",
+                            "tool_name": logical_tool_name,
+                            "logical_tool_name": logical_tool_name,
+                            "model_tool_name": model_tool_name,
+                            "tool_call_id": getattr(tool_call, "id", None),
+                            "trace_id": f"result:{tool_trace_id}",
+                            "span_id": tool_span_id,
+                            "parent_span_id": tool_parent_span_id,
+                            "status": "approval_required",
+                            "success": False,
+                            "error_code": "approval_required",
+                            "duration_ms": round(
+                                (time.perf_counter() - tool_started_at) * 1000,
+                                3,
+                            ),
+                            "content": "",
+                        },
+                    )
                     raise ApprovalRequired(proposal)
 
                 if router is not None:
@@ -4584,10 +7001,16 @@ class MemAgent:
                         result = "Error: No tool manager available"
                         error_message = "No tool manager available"
 
-                failed = self._tool_result_failed(result)
+                result, tool_outcome = normalize_tool_result(result)
+                failed = not tool_outcome.ok
                 if failed and error_message is None:
                     error_message = (
-                        str(result.get("error"))
+                        str(
+                            result.get("error")
+                            or result.get("message")
+                            or tool_outcome.reason_code
+                            or "Tool execution failed"
+                        )
                         if isinstance(result, dict)
                         else str(result)
                     )
@@ -4600,18 +7023,64 @@ class MemAgent:
                         "result": result,
                         "call_hash": routed_call_hash,
                         "warnings": routed_warnings,
+                        "outcome": tool_outcome.to_dict(),
                     }
 
-        if streaming:
-            self._emit_stream_trace_chunks(
-                "tool_result",
-                f"Tool Result: {tool_name}",
-                result,
-                trace_id=f"result:{tool_trace_id}",
-                chunk_size=420,
-                preview_limit=12000,
-                extra={"tool_name": tool_name},
-            )
+        if tool_outcome is None:
+            result, tool_outcome = normalize_tool_result(result)
+        tool_failed = not tool_outcome.ok
+        if (
+            tool_outcome.status is not ToolOutcomeStatus.SUCCESS
+            and not self._cache_bypass_reason
+        ):
+            self._cache_bypass_reason = f"tool_outcome_{tool_outcome.status.value}"
+        outcome_payload = tool_outcome.to_dict()
+        duration_ms = round((time.perf_counter() - tool_started_at) * 1000, 3)
+        error_code = (
+            _to_jsonable(result.get("error_code"))
+            if isinstance(result, dict) and result.get("error_code") is not None
+            else outcome_payload.get("reason_code", "")
+        )
+        outcome_record = {
+            "tool_name": logical_tool_name,
+            "model_tool_name": model_tool_name,
+            "tool_call_id": getattr(tool_call, "id", None),
+            "duration_ms": duration_ms,
+            **outcome_payload,
+        }
+        self._last_tool_outcomes = [
+            *list(self._last_tool_outcomes or []),
+            outcome_record,
+        ]
+        self._emit_stream_trace_chunks(
+            "tool_result",
+            f"Tool Result: {logical_tool_name}",
+            result,
+            trace_id=f"result:{tool_trace_id}",
+            chunk_size=420,
+            preview_limit=12000,
+            extra={
+                "tool_name": logical_tool_name,
+                "logical_tool_name": logical_tool_name,
+                "model_tool_name": model_tool_name,
+                "tool_call_id": getattr(tool_call, "id", None),
+                "span_id": tool_span_id,
+                "parent_span_id": tool_parent_span_id,
+                "status": "error" if tool_failed else "success",
+                "outcome": tool_outcome.status.value,
+                "outcome_reason_code": tool_outcome.reason_code,
+                "tool_provider": tool_outcome.provider,
+                "primary_provider": tool_outcome.primary_provider,
+                "fallback_provider": tool_outcome.fallback_provider,
+                "outcome_retryable": tool_outcome.retryable,
+                "result_count": tool_outcome.result_count,
+                "fallback_used": tool_outcome.fallback_used,
+                "degraded": tool_outcome.degraded,
+                "success": not tool_failed,
+                "error_code": error_code,
+                "duration_ms": duration_ms,
+            },
+        )
 
         # Serialize exactly once and decide before persistence. Small results
         # remain inline and create no tool-log row; expansion tools can never
@@ -4634,8 +7103,10 @@ class MemAgent:
                     memory_id=self._current_memory_id,
                     agent_id=self.agent_id,
                     tool_call_id=getattr(tool_call, "id", None),
-                    success=(error_message is None),
+                    success=tool_outcome.ok,
                     error=error_message,
+                    outcome=tool_outcome.status.value,
+                    outcome_details=outcome_payload,
                     thread_id=self._current_thread_id,
                     user_id=user_id,
                 )
@@ -4705,10 +7176,25 @@ class MemAgent:
                     "result": result,
                     "timestamp": datetime.now().isoformat(),
                     "error": error_message,
+                    "tool_outcome": outcome_payload,
                 },
             )
             if error_message is not None:
                 workflow.outcome = WorkflowOutcome.FAILURE
+
+        if self.learning_control_plane is not None:
+            try:
+                self.learning_control_plane.record_tool(
+                    tool_name=logical_tool_name,
+                    arguments=logical_arguments,
+                    result=result,
+                    success=not tool_failed,
+                    outcome=outcome_payload,
+                    duration_ms=duration_ms,
+                    scope=self._trace_identity_payload(),
+                )
+            except Exception as exc:
+                logger.debug("Learning tool-event capture failed: %s", exc)
 
         # Return the complete in-process value. Callers that need deterministic
         # execution evidence (notably durable approval resumption) must not
@@ -4717,6 +7203,212 @@ class MemAgent:
         return result
 
     def _execute_llm_interaction_stream(
+        self, system_prompt, query, context, user_id=None, request_context=None
+    ):
+        session = session_for(self)
+        if session is None:
+            yield from self._execute_llm_interaction_stream_legacy(
+                system_prompt,
+                query,
+                context,
+                user_id=user_id,
+                request_context=request_context,
+            )
+            return
+        from ..llms.streaming import ProviderStreamError, streaming_capabilities
+
+        workflow = self._init_workflow_capture(query, user_id)
+        messages = self._build_prompt_messages(
+            system_prompt, query, context, request_context=request_context
+        )
+        if getattr(self, "semantic_tool_router", None) is not None:
+            self.semantic_tool_router.begin_turn(user_id=user_id)
+        tools = list(self._build_llm_tools(query, user_id=user_id) or [])
+        if tools and not streaming_capabilities(self.model)["tool_calls"]:
+            raise ProviderStreamError("provider_tools_unsupported")
+        self._set_provider_cache_scope()
+        finalize = "memorizz_finalize_answer"
+        final_phase = not tools
+        if session.mode == "final_stream" and tools:
+            if any(tool.get("function", {}).get("name") == finalize for tool in tools):
+                raise ProviderStreamError("reserved_finalizer_tool_name")
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": finalize,
+                        "description": "Finish the private tool phase. Call alone after collecting all required evidence; the host then enables public answer generation with tools disabled. Do not draft the answer before this call.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Use tools to collect evidence, then call memorizz_finalize_answer alone. Do not draft the public answer until the host accepts finalization.",
+                }
+            )
+        tool_count = rejections = 0
+        try:
+            for iteration in range(self._get_tool_iteration_limit()):
+                check_cancelled()
+                session.attempt = iteration + 1
+                # Only evidence-only policies are valid for this phase. No final
+                # text validator is bypassed to obtain irreversible live output.
+                if session.mode == "final_stream" and final_phase:
+                    decision = self._evaluate_completion_candidate(
+                        query=query,
+                        response="",
+                        iteration=iteration + 1,
+                        tool_call_count=tool_count,
+                    )
+                    if not decision.accepted:
+                        raise CompletionRejectedError(decision, rejections)
+                pending, had_tools, terminal = [], False, False
+                session.emit(
+                    "status",
+                    stage="answer_generation" if final_phase else "tool_phase",
+                    attempt=iteration + 1,
+                )
+                provider = self._generate_stream_with_trace(
+                    _to_jsonable(messages),
+                    tools=None if final_phase else tools,
+                    iteration=iteration + 1,
+                    stage="agent_stream",
+                )
+                try:
+                    for event in provider:
+                        check_cancelled()
+                        kind = event.get("type")
+                        if kind == "content":
+                            delta = event.get("content", "")
+                            pending.append(delta)
+                            if session.mode == "final_stream" and final_phase:
+                                yield delta
+                        elif kind == "usage":
+                            usage = {
+                                k: v
+                                for k, v in (event.get("usage") or {}).items()
+                                if k
+                                in {
+                                    "prompt_tokens",
+                                    "completion_tokens",
+                                    "total_tokens",
+                                    "cached_tokens",
+                                }
+                                and (v is None or type(v) is int)
+                            }
+                            session.emit("usage", usage=usage, attempt=iteration + 1)
+                        elif kind == "tool_calls":
+                            self._record_context_window_usage(
+                                stage=f"stream_iteration_{iteration + 1}"
+                            )
+                            terminal, had_tools = True, True
+                            if final_phase:
+                                raise ProviderStreamError(
+                                    "unexpected_tool_call_in_final_answer"
+                                )
+                            message = event["response"].choices[0].message
+                            self._append_assistant_tool_calls(messages, message)
+                            for call in message.tool_calls:
+                                check_cancelled()
+                                if (
+                                    call.function.name == finalize
+                                    and session.mode == "final_stream"
+                                ):
+                                    decision = self._evaluate_completion_candidate(
+                                        query=query,
+                                        response="",
+                                        iteration=iteration + 1,
+                                        tool_call_count=tool_count,
+                                    )
+                                    accepted = (
+                                        decision.accepted
+                                        and len(message.tool_calls) == 1
+                                    )
+                                    messages.append(
+                                        {
+                                            "role": "tool",
+                                            "tool_call_id": call.id,
+                                            "content": "Finalization accepted. Produce the public answer now; tools are disabled."
+                                            if accepted
+                                            else "Finalization rejected. Complete prerequisites and call this tool alone.",
+                                        }
+                                    )
+                                    final_phase = accepted
+                                else:
+                                    tool_count += 1
+                                    self._execute_and_record_tool_call(
+                                        call,
+                                        messages,
+                                        workflow,
+                                        user_id,
+                                        streaming=True,
+                                        query=query,
+                                    )
+                        elif kind == "done":
+                            self._record_context_window_usage(
+                                stage=f"stream_iteration_{iteration + 1}"
+                            )
+                            terminal = True
+                            if had_tools:
+                                continue
+                            candidate = "".join(pending)
+                            if event.get("content", candidate) != candidate:
+                                raise ProviderStreamError("provider_delta_mismatch")
+                            if session.mode == "final_stream" and not final_phase:
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": "Finish tool evidence collection and call memorizz_finalize_answer alone; do not draft the answer.",
+                                    }
+                                )
+                                break
+                            decision = self._evaluate_completion_candidate(
+                                query=query,
+                                response=candidate,
+                                iteration=iteration + 1,
+                                tool_call_count=tool_count,
+                            )
+                            if not decision.accepted:
+                                rejections += 1
+                                if rejections > self.completion_policy.max_rejections:
+                                    raise CompletionRejectedError(decision, rejections)
+                                self._append_completion_rejection(
+                                    messages,
+                                    candidate,
+                                    self.completion_policy.retry_message(decision),
+                                )
+                                break
+                            if session.mode == "buffered" and candidate:
+                                yield candidate
+                            session.answer_done()
+                            return
+                finally:
+                    provider.close()
+                if not terminal:
+                    raise ProviderStreamError("provider_stream_incomplete")
+            raise ProviderStreamError("iteration_limit")
+        except ApprovalRequired as approval:
+            session.outcome = "approval_required"
+            proposal = approval.proposal
+            session.emit(
+                "approval.required", proposal=proposal.to_dict(include_arguments=False)
+            )
+        finally:
+            session.persistence["workflow"] = (
+                "written"
+                if self._persist_workflow_run(workflow)
+                else "unknown"
+                if workflow and workflow.steps
+                else "not_requested"
+            )
+
+    def _execute_llm_interaction_stream_legacy(
         self,
         system_prompt: str,
         query: str,
@@ -4757,6 +7449,9 @@ class MemAgent:
 
         # Streaming loop with tool calling
         max_iterations = self._get_tool_iteration_limit()
+        tool_call_count = 0
+        rejection_count = 0
+        gate_enabled = self.completion_policy.enabled
         try:
             for iteration in range(max_iterations):
                 # Belt-and-braces: messages get appended inside this loop
@@ -4765,10 +7460,21 @@ class MemAgent:
                 # risks re-entering on subsequent iterations, so coerce once
                 # per LLM call.
                 messages = _to_jsonable(messages)
-                for event in self.model.generate_stream(messages, tools=tools):
+                pending_content: List[str] = []
+                iteration_had_tool_calls = False
+                for event in self._generate_stream_with_trace(
+                    messages,
+                    tools=tools,
+                    iteration=iteration + 1,
+                    stage="agent_stream",
+                ):
                     event_type = event.get("type")
                     if event_type == "content":
-                        yield event.get("content", "")
+                        content_chunk = event.get("content", "")
+                        if gate_enabled:
+                            pending_content.append(content_chunk)
+                        else:
+                            yield content_chunk
 
                     elif event_type == "reasoning":
                         reasoning_preview = self._preview_stream_payload(
@@ -4785,6 +7491,7 @@ class MemAgent:
                             )
 
                     elif event_type == "tool_calls":
+                        iteration_had_tool_calls = True
                         self._record_context_window_usage(
                             stage=f"stream_iteration_{iteration + 1}"
                         )
@@ -4794,6 +7501,7 @@ class MemAgent:
 
                         self._append_assistant_tool_calls(messages, message)
                         for tool_call in message.tool_calls:
+                            tool_call_count += 1
                             self._execute_and_record_tool_call(
                                 tool_call,
                                 messages,
@@ -4810,7 +7518,37 @@ class MemAgent:
                         self._record_context_window_usage(
                             stage=f"stream_iteration_{iteration + 1}"
                         )
-                        # No tool calls, streaming complete for this iteration
+                        if iteration_had_tool_calls:
+                            continue
+                        # A completion gate must buffer the iteration: exposing
+                        # rejected tokens to a client would make enforcement
+                        # cosmetic rather than real.
+                        if gate_enabled:
+                            final_content = "".join(pending_content)
+                            decision = self._evaluate_completion_candidate(
+                                query=query,
+                                response=final_content,
+                                iteration=iteration + 1,
+                                tool_call_count=tool_call_count,
+                            )
+                            if not decision.accepted:
+                                rejection_count += 1
+                                if (
+                                    rejection_count
+                                    > self.completion_policy.max_rejections
+                                ):
+                                    raise CompletionRejectedError(
+                                        decision, rejection_count
+                                    )
+                                self._append_completion_rejection(
+                                    messages,
+                                    final_content,
+                                    self.completion_policy.retry_message(decision),
+                                )
+                                break
+                            if final_content:
+                                yield final_content
+                        # No tool calls, streaming complete for this iteration.
                         _store_workflow_if_needed()
                         return
 
@@ -4820,6 +7558,16 @@ class MemAgent:
 
             # Exhausted iterations
             _store_workflow_if_needed()
+            exhausted = CompletionDecision(
+                accepted=False,
+                code="iteration_limit",
+                reason=(
+                    "The tool/completion loop reached its maximum iteration "
+                    f"count ({max_iterations}) before an acceptable completion."
+                ),
+            )
+            if gate_enabled:
+                raise CompletionRejectedError(exhausted, rejection_count)
             yield (
                 "\n\nI reached the maximum number of tool-call iterations "
                 f"({max_iterations}). Please try again."
@@ -4837,9 +7585,18 @@ class MemAgent:
         query: str,
         memory_id: str,
         user_id: Optional[str] = None,
+        *,
+        include_entity_memory: bool = True,
     ) -> Dict[str, Any]:
         """Build context for the query using memory manager."""
         context = {"query": query}
+        self._last_retrieved_memories = []
+        self._last_selection_ledger = []
+        self._last_retrieval_stats = {
+            "duration_ms": 0.0,
+            "candidate_count": 0,
+            "selected_count": 0,
+        }
 
         # Learned-skill retrieval (continual learning). Reset the turn's
         # attribution first so a retrieval failure — or no match — never
@@ -4910,30 +7667,107 @@ class MemAgent:
             # and the merged candidate set is deduplicated before injection.
             # The TOOLBOX is deliberately not pre-retrieved: tool schemas
             # already ride along in the request's ``tools`` parameter.
+            retrieval_started = time.perf_counter()
+            candidates: List[Tuple[str, Any]] = []
+            selected: List[Dict[str, Any]] = []
+            retrieval_queries = [query]
             try:
                 active = set(self.active_memory_types or [])
                 candidate_sources = []
-                if MemoryType.KNOWLEDGE_BASE in active:
+                policy = self.retrieval_policy
+                if policy.query_expansion:
+                    try:
+                        from ..retrieval_concepts import expand_query_concepts
+
+                        retrieval_queries.extend(expand_query_concepts(query))
+                    except Exception as exc:
+                        logger.debug("Query expansion skipped: %s", exc)
+                retrieval_queries = retrieval_queries[: policy.max_query_variants]
+                if (
+                    self.learning_control_plane is not None
+                    and self.learning_control_plane_config.retrieval_enabled
+                ):
+                    history_texts = [
+                        str((item.get("content") or {}).get("content") or "")
+                        if isinstance(item.get("content"), dict)
+                        else str(item.get("content") or "")
+                        for item in context.get("conversation_history", [])
+                        if isinstance(item, dict)
+                    ]
+                    try:
+                        context[
+                            "evidence_pack"
+                        ] = self.learning_control_plane.retrieve_evidence(
+                            query,
+                            memory_id=memory_id,
+                            user_id=user_id,
+                            thread_id=self._current_thread_id,
+                            run_id=self._current_run_id,
+                            turn_id=self._current_turn_id,
+                            trace_id=self._current_root_trace_id,
+                            history_texts=history_texts,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "EvidencePack retrieval failed; using legacy retrieval: %s",
+                            exc,
+                        )
+                    else:
+                        # EvidencePack owns multi-source retrieval for this
+                        # turn; skip the duplicate legacy retrieval path.
+                        active = set()
+                if (
+                    MemoryType.KNOWLEDGE_BASE in active
+                    and policy.knowledge_base_scope != "disabled"
+                ):
+                    if policy.knowledge_base_scope == "namespace":
+                        candidate_sources.extend(
+                            (
+                                MemoryType.KNOWLEDGE_BASE,
+                                "knowledge_base",
+                                None,
+                                namespace,
+                            )
+                            for namespace in policy.knowledge_base_namespaces
+                        )
+                    else:
+                        candidate_sources.append(
+                            (MemoryType.KNOWLEDGE_BASE, "knowledge_base", None, None)
+                        )
+                if (
+                    MemoryType.CONVERSATION_MEMORY in active
+                    and policy.conversation_scope != "disabled"
+                ):
                     candidate_sources.append(
-                        (MemoryType.KNOWLEDGE_BASE, "knowledge_base")
-                    )
-                if MemoryType.CONVERSATION_MEMORY in active:
-                    candidate_sources.append(
-                        (MemoryType.CONVERSATION_MEMORY, "episodic")
+                        (
+                            MemoryType.CONVERSATION_MEMORY,
+                            "episodic",
+                            self._current_thread_id
+                            if policy.conversation_scope == "thread"
+                            else None,
+                            None,
+                        )
                     )
 
-                candidates: List[Tuple[str, Any]] = []
-                for memory_type, source in candidate_sources:
-                    snippets = self.memory_manager.retrieve_relevant_memories(
-                        query=query,
-                        memory_type=memory_type,
-                        memory_id=memory_id,
-                        limit=_RETRIEVAL_CANDIDATE_LIMIT,
-                        user_id=user_id,
-                        include_embedding=True,
-                    )
-                    for row in snippets or []:
-                        candidates.append((source, row))
+                for (
+                    memory_type,
+                    source,
+                    retrieval_thread_id,
+                    namespace,
+                ) in candidate_sources:
+                    for retrieval_query in retrieval_queries:
+                        snippets = self.memory_manager.retrieve_relevant_memories(
+                            query=retrieval_query,
+                            memory_type=memory_type,
+                            memory_id=memory_id,
+                            limit=policy.candidate_limit,
+                            user_id=user_id,
+                            include_embedding=True,
+                            thread_id=retrieval_thread_id,
+                            namespace=namespace,
+                        )
+                        for row in snippets or []:
+                            candidates.append((source, row))
 
                 if candidates:
                     history_texts = [
@@ -4957,24 +7791,42 @@ class MemAgent:
                         candidates,
                         history_texts=history_texts,
                         query_embedding=query_embedding,
-                        max_items=_RETRIEVED_MEMORIES_MAX,
+                        max_items=policy.max_items,
+                        dedupe_parent_sources=policy.dedupe_parent_sources,
+                        selection_ledger=self._last_selection_ledger,
                     )
                     if selected:
                         context["retrieved_memories"] = selected
             except Exception as e:
                 logger.warning(f"Failed to retrieve relevant memories: {e}")
+            finally:
+                self._last_retrieved_memories = [dict(item) for item in selected]
+                self._last_retrieval_stats = {
+                    "duration_ms": (time.perf_counter() - retrieval_started) * 1000,
+                    "candidate_count": len(candidates),
+                    "selected_count": len(selected),
+                    "query_variants": list(retrieval_queries),
+                }
 
         if (
-            self._entity_memory_enabled
+            include_entity_memory
+            and self.learning_control_plane is None
+            and self._entity_memory_enabled
             and self.entity_memory_manager
             and self.entity_memory_manager.is_enabled()
         ):
             try:
-                entity_context = self.entity_memory_manager.build_context(
-                    query=query, memory_id=memory_id, user_id=user_id
+                entity_result = (
+                    self.entity_memory_manager.build_context_with_diagnostics(
+                        query=query, memory_id=memory_id, user_id=user_id
+                    )
                 )
+                entity_context = entity_result.get("profiles") or []
                 if entity_context:
                     context["entity_memory_profiles"] = entity_context
+                context["entity_memory_retrieval"] = dict(
+                    entity_result.get("retrieval") or {}
+                )
             except Exception as e:
                 logger.warning(f"Failed to retrieve entity memory context: {e}")
 
@@ -4986,9 +7838,10 @@ class MemAgent:
                     agent_id=self.agent_id,
                     limit=20,
                     user_id=user_id,
+                    thread_id=self._current_thread_id,
                 )
-                if summaries:
-                    context["summaries"] = summaries
+                if isinstance(summaries, (list, tuple)) and summaries:
+                    context["summaries"] = list(summaries)
             except Exception as e:
                 logger.debug("Failed to load summary references: %s", e)
 
@@ -5289,6 +8142,64 @@ class MemAgent:
 
         return "\n\n".join(prompt_parts)
 
+    def _evaluate_completion_candidate(
+        self,
+        *,
+        query: str,
+        response: str,
+        iteration: int,
+        tool_call_count: int,
+    ) -> CompletionDecision:
+        """Apply the host policy and retain serializable decision evidence."""
+        candidate = CompletionCandidate(
+            query=query,
+            response=str(response),
+            iteration=iteration,
+            tool_call_count=tool_call_count,
+            metadata={
+                "memory_id": self._current_memory_id,
+                "thread_id": self._current_thread_id,
+                "user_id": self._current_user_id,
+                "run_id": self._current_run_id,
+            },
+        )
+        decision = self.completion_policy.evaluate(candidate)
+        decisions = list(self._last_completion_decisions or [])
+        decisions.append(decision.to_dict())
+        self._last_completion_decisions = decisions
+        self._emit_stream_event(
+            "completion_check",
+            {
+                **decision.to_dict(),
+                "agent_id": self.agent_id,
+                "validator_name": self.completion_policy.validator_name,
+            },
+        )
+        return decision
+
+    def completion_policy_report(self) -> Dict[str, Any]:
+        """Return the current policy and evidence from the most recent turn."""
+        decisions = list(self._last_completion_decisions or [])
+        return {
+            "policy": self.completion_policy.to_dict(),
+            "decision_count": len(decisions),
+            "rejection_count": sum(
+                1 for decision in decisions if not decision.get("accepted", False)
+            ),
+            "accepted": bool(decisions and decisions[-1].get("accepted", False)),
+            "decisions": decisions,
+        }
+
+    @staticmethod
+    def _append_completion_rejection(
+        messages: List[Dict[str, Any]],
+        response: str,
+        retry_message: str,
+    ) -> None:
+        """Preserve the proposed answer and reject it without rebuilding state."""
+        messages.append({"role": "assistant", "content": str(response)})
+        messages.append({"role": "developer", "content": retry_message})
+
     def _execute_llm_interaction(
         self,
         system_prompt: str,
@@ -5322,18 +8233,42 @@ class MemAgent:
 
             # Execute main loop with tool calling
             max_iterations = self._get_tool_iteration_limit()
+            tool_call_count = 0
+            rejection_count = 0
             for iteration in range(max_iterations):
                 # Coerce LOBs to strings before every LLM call; matches the
                 # streaming path's guarantee.
                 messages = _to_jsonable(messages)
                 # Call LLM
-                response = self.model.generate(messages, tools=tools)
+                response = self._generate_with_trace(
+                    messages,
+                    tools=tools,
+                    iteration=iteration + 1,
+                    stage="agent_run",
+                )
                 self._record_context_window_usage(stage=f"iteration_{iteration + 1}")
 
                 # Check if response is a string (no tool calls)
                 if isinstance(response, str):
-                    self._persist_workflow_run(workflow)
-                    return response
+                    final_content = response
+                    decision = self._evaluate_completion_candidate(
+                        query=query,
+                        response=final_content,
+                        iteration=iteration + 1,
+                        tool_call_count=tool_call_count,
+                    )
+                    if decision.accepted:
+                        self._persist_workflow_run(workflow)
+                        return final_content
+                    rejection_count += 1
+                    if rejection_count > self.completion_policy.max_rejections:
+                        raise CompletionRejectedError(decision, rejection_count)
+                    self._append_completion_rejection(
+                        messages,
+                        final_content,
+                        self.completion_policy.retry_message(decision),
+                    )
+                    continue
 
                 # Handle tool calls
                 if hasattr(response, "choices") and response.choices:
@@ -5346,11 +8281,28 @@ class MemAgent:
                             if message.content
                             else "I couldn't generate a response."
                         )
-                        self._persist_workflow_run(workflow)
-                        return final_content
+                        decision = self._evaluate_completion_candidate(
+                            query=query,
+                            response=final_content,
+                            iteration=iteration + 1,
+                            tool_call_count=tool_call_count,
+                        )
+                        if decision.accepted:
+                            self._persist_workflow_run(workflow)
+                            return final_content
+                        rejection_count += 1
+                        if rejection_count > self.completion_policy.max_rejections:
+                            raise CompletionRejectedError(decision, rejection_count)
+                        self._append_completion_rejection(
+                            messages,
+                            final_content,
+                            self.completion_policy.retry_message(decision),
+                        )
+                        continue
 
                     self._append_assistant_tool_calls(messages, message)
                     for tool_call in message.tool_calls:
+                        tool_call_count += 1
                         self._execute_and_record_tool_call(
                             tool_call,
                             messages,
@@ -5365,10 +8317,18 @@ class MemAgent:
 
                 # Fallback: return any content we got
                 fallback_response = "I encountered an unexpected response format."
+                if session_for(self) is not None:
+                    from ..llms.streaming import ProviderStreamError
+
+                    raise ProviderStreamError("unexpected_response_format")
                 self._persist_workflow_run(workflow)
                 return fallback_response
 
             # If we exhausted iterations
+            if session_for(self) is not None:
+                from ..llms.streaming import ProviderStreamError
+
+                raise ProviderStreamError("iteration_limit")
             final_response = (
                 "I reached the maximum number of tool-call iterations "
                 f"({max_iterations}). Please try again."
@@ -5382,9 +8342,23 @@ class MemAgent:
         except ApprovalRequired as approval:
             if "workflow" in locals():
                 self._persist_workflow_run(workflow)
+            session = session_for(self)
+            if session is not None:
+                session.outcome = "approval_required"
+                session.emit(
+                    "approval.required",
+                    proposal=approval.proposal.to_dict(include_arguments=False),
+                )
+                return ""
             return self._approval_required_payload(approval.proposal)
+        except CompletionRejectedError:
+            if "workflow" in locals():
+                self._persist_workflow_run(workflow)
+            raise
         except Exception as e:
             logger.error(f"LLM interaction failed: {e}")
+            if session_for(self) is not None:
+                raise
 
             # Store workflow even on error if it exists
             if "workflow" in locals():
@@ -5414,37 +8388,93 @@ class MemAgent:
             resolved_memory_id = self._current_memory_id or (
                 self.memory_ids[0] if self.memory_ids else None
             )
-            matches = self.entity_memory_manager.lookup_entities(
+            result = self.entity_memory_manager.lookup_entities_with_diagnostics(
                 entity_id=entity_id,
                 name=name,
                 query=query,
                 limit=limit,
                 memory_id=resolved_memory_id,
+                user_id=self._current_user_id,
             )
             logger.info(
-                "entity_memory_lookup returned %s record(s) (memory_id=%s)",
-                len(matches),
+                "entity_memory_lookup returned %s record(s) "
+                "(memory_id=%s, mode=%s, degraded=%s, reason=%s)",
+                len(result.get("matches") or []),
                 resolved_memory_id,
+                (result.get("retrieval") or {}).get("retrieval_mode"),
+                (result.get("retrieval") or {}).get("degraded"),
+                (result.get("retrieval") or {}).get("degraded_reason"),
             )
-            return {"matches": matches}
+            return result
 
         def _normalize_attributes(attrs):
             """Normalize attributes from various formats to list of dicts with name/value."""
             if not attrs:
                 return None
+            parsed = attrs
             if isinstance(attrs, str):
                 if not attrs.strip():
                     return None
                 try:
                     parsed = json.loads(attrs)
-                    if isinstance(parsed, dict):
-                        return [{"name": k, "value": str(v)} for k, v in parsed.items()]
-                    return parsed if isinstance(parsed, list) else None
                 except (json.JSONDecodeError, TypeError):
                     return None
-            if isinstance(attrs, dict):
-                return [{"name": k, "value": str(v)} for k, v in attrs.items()]
-            return attrs if isinstance(attrs, list) else None
+            if isinstance(parsed, dict):
+                aliases = {"name", "attribute", "attribute_name", "key"}
+                if "value" in parsed and aliases.intersection(parsed):
+                    parsed = [parsed]
+                else:
+                    parsed = [
+                        {"name": key, "value": str(value)}
+                        for key, value in parsed.items()
+                    ]
+            if not isinstance(parsed, list):
+                return None
+
+            normalized = []
+            for index, raw in enumerate(parsed):
+                if isinstance(raw, EntityAttributeInput):
+                    item = raw
+                elif isinstance(raw, dict):
+                    payload = dict(raw)
+                    aliases = {"name", "attribute", "attribute_name", "key"}
+                    if "value" not in payload and not aliases.intersection(payload):
+                        reserved = {
+                            "confidence",
+                            "source",
+                            "created_at",
+                            "updated_at",
+                            "metadata",
+                        }
+                        facts = [
+                            (key, value)
+                            for key, value in payload.items()
+                            if key not in reserved
+                        ]
+                        if facts:
+                            shared = {
+                                key: value
+                                for key, value in payload.items()
+                                if key in reserved
+                            }
+                            for key, value in facts:
+                                fact_payload = {
+                                    **shared,
+                                    "name": key,
+                                    "value": str(value),
+                                }
+                                fact = EntityAttributeInput.model_validate(fact_payload)
+                                normalized.append(fact.model_dump(exclude_none=True))
+                            continue
+                    if "value" in payload and not isinstance(payload["value"], str):
+                        payload["value"] = str(payload["value"])
+                    item = EntityAttributeInput.model_validate(payload)
+                else:
+                    raise ValueError(
+                        f"Entity attribute at index {index} must be an object."
+                    )
+                normalized.append(item.model_dump(exclude_none=True))
+            return normalized
 
         def _normalize_json_field(field, expected_type):
             """Normalize JSON string fields to expected type."""
@@ -5460,20 +8490,36 @@ class MemAgent:
                     return None
             return field if isinstance(field, expected_type) else None
 
+        def _normalize_relations(relations):
+            parsed = _normalize_json_field(relations, list)
+            if parsed is None:
+                return None
+            normalized = []
+            for index, raw in enumerate(parsed):
+                if isinstance(raw, EntityRelationInput):
+                    item = raw
+                elif isinstance(raw, dict):
+                    item = EntityRelationInput.model_validate(raw)
+                else:
+                    raise ValueError(
+                        f"Entity relation at index {index} must be an object."
+                    )
+                normalized.append(item.model_dump(exclude_none=True))
+            return normalized
+
         def entity_memory_upsert(
             entity_id: str = None,
             name: str = None,
             entity_type: str = None,
-            attributes: Optional[List[Dict[str, Any]]] = None,
-            relations: Optional[List[Dict[str, Any]]] = None,
+            attributes: Optional[List[EntityAttributeInput]] = None,
+            relations: Optional[List[EntityRelationInput]] = None,
             metadata: Optional[Dict[str, Any]] = None,
-            memory_id: str = None,
         ) -> Dict[str, Any]:
-            """Insert or update a structured entity record."""
-            resolved_memory_id = (
-                memory_id
-                or self._current_memory_id
-                or (self.memory_ids[0] if self.memory_ids else None)
+            """Insert or update a structured entity in the active run scope."""
+            # Scope is host-owned and deliberately absent from the model-visible
+            # schema. The model supplies entity facts, never tenant identifiers.
+            resolved_memory_id = self._current_memory_id or (
+                self.memory_ids[0] if self.memory_ids else None
             )
             if resolved_memory_id is None:
                 raise ValueError("A memory_id is required to store entity information.")
@@ -5483,16 +8529,24 @@ class MemAgent:
                 name=name,
                 entity_type=entity_type,
                 attributes=_normalize_attributes(attributes),
-                relations=_normalize_json_field(relations, list),
+                relations=_normalize_relations(relations),
                 metadata=_normalize_json_field(metadata, dict),
                 memory_id=resolved_memory_id,
+                user_id=self._current_user_id,
             )
             logger.info(
                 "entity_memory_upsert stored entity_id=%s (memory_id=%s)",
                 new_entity_id,
                 resolved_memory_id,
             )
-            return {"entity_id": new_entity_id}
+            return {
+                "entity_id": new_entity_id,
+                "storage": {
+                    "memory_id_bound": resolved_memory_id is not None,
+                    "user_id_bound": self._current_user_id is not None,
+                    "scope_override_rejected": False,
+                },
+            }
 
         entity_memory_lookup.__name__ = "entity_memory_lookup"
         entity_memory_upsert.__name__ = "entity_memory_upsert"
@@ -5659,31 +8713,61 @@ class MemAgent:
         if self._internet_access_tools_registered:
             return
 
-        def internet_search(query: str, max_results: int = 5) -> Dict[str, Any]:
+        def internet_search(query: str, max_results: int = 5) -> Any:
             """Search the public internet for up-to-date information."""
             try:
                 if self._internet_access_disabled_reason:
-                    return {
-                        "error": f"Internet access disabled: {self._internet_access_disabled_reason}"
-                    }
+                    message = f"Internet access disabled: {self._internet_access_disabled_reason}"
+                    return self._internet_error_result(
+                        {
+                            "ok": False,
+                            "error_code": "provider_unavailable",
+                            "error": message,
+                        },
+                        reason_code="provider_unavailable",
+                        retryable=True,
+                    )
                 results = self.internet_access_manager.search(
                     query=query, max_results=max_results
                 )
                 self._internet_access_failure_count = 0
+                provider_name = self.get_internet_access_provider_name()
+                if provider_name == "offline":
+                    return self._internet_error_result(
+                        {"results": results},
+                        reason_code="provider_unavailable",
+                        retryable=False,
+                        result_count=0,
+                    )
                 return {"results": results}
             except Exception as exc:
                 logger.error("internet_search failed: %s", exc)
                 return self._handle_internet_access_error(str(exc))
 
-        def open_web_page(url: str) -> Dict[str, Any]:
+        def open_web_page(url: str) -> Any:
             """Fetch and summarize the contents of a website."""
             try:
                 if self._internet_access_disabled_reason:
-                    return {
-                        "error": f"Internet access disabled: {self._internet_access_disabled_reason}"
-                    }
+                    message = f"Internet access disabled: {self._internet_access_disabled_reason}"
+                    return self._internet_error_result(
+                        {
+                            "ok": False,
+                            "error_code": "provider_unavailable",
+                            "error": message,
+                        },
+                        reason_code="provider_unavailable",
+                        retryable=True,
+                    )
                 page = self.internet_access_manager.fetch_url(url=url)
                 self._internet_access_failure_count = 0
+                provider_name = self.get_internet_access_provider_name()
+                if provider_name == "offline":
+                    return self._internet_error_result(
+                        page,
+                        reason_code="provider_unavailable",
+                        retryable=False,
+                        result_count=0,
+                    )
                 return page
             except Exception as exc:
                 logger.error("open_web_page failed: %s", exc)
@@ -5695,6 +8779,26 @@ class MemAgent:
         self.tool_manager.add_tool(internet_search)
         self.tool_manager.add_tool(open_web_page)
         self._internet_access_tools_registered = True
+
+    def _internet_error_result(
+        self,
+        value: Any,
+        *,
+        reason_code: str,
+        retryable: bool,
+        result_count: Optional[int] = None,
+    ) -> ToolResult:
+        """Attach provider-error evidence without changing model-visible data."""
+        return ToolResult(
+            value=value,
+            outcome=ToolOutcome(
+                status=ToolOutcomeStatus.PROVIDER_ERROR,
+                reason_code=reason_code,
+                provider=self.get_internet_access_provider_name(),
+                retryable=retryable,
+                result_count=result_count,
+            ),
+        )
 
     def _register_persona_tools(self) -> None:
         """Register ``update_persona`` and ``read_persona`` tools on the agent.
@@ -6160,9 +9264,13 @@ class MemAgent:
                 self._internet_access_failure_count,
             )
         return {
+            "ok": False,
+            "error_code": "provider_error",
+            "provider": self.get_internet_access_provider_name(),
+            "retryable": not bool(self._internet_access_disabled_reason),
             "error": message
             if not self._internet_access_disabled_reason
-            else f"{message} | {self._internet_access_disabled_reason}"
+            else f"{message} | {self._internet_access_disabled_reason}",
         }
 
     def _record_interaction(
@@ -6174,7 +9282,10 @@ class MemAgent:
         user_id: Optional[str] = None,
     ):
         """Record the interaction in memory."""
+        session = session_for(self)
         if not self.memory_manager:
+            if session:
+                session.persistence["conversation"] = "not_configured"
             return
 
         try:
@@ -6200,6 +9311,8 @@ class MemAgent:
                         "Skipping duplicate interaction write for memory %s",
                         memory_id,
                     )
+                    if session:
+                        session.persistence["conversation"] = "deduplicated"
                     return
             except Exception:
                 pass
@@ -6227,6 +9340,10 @@ class MemAgent:
             assistant_unit_id = self.memory_manager.save_memory_unit(
                 assistant_memory, memory_id
             )
+            if session:
+                session.persistence["conversation"] = (
+                    "written" if user_unit_id and assistant_unit_id else "unknown"
+                )
 
             # Backfill embeddings off the hot path so episodic semantic
             # recall (vector search over conversation rows) has vectors to
@@ -6243,6 +9360,8 @@ class MemAgent:
 
         except Exception as e:
             logger.warning(f"Failed to record interaction: {e}")
+            if session:
+                session.persistence["conversation"] = "failed"
 
     def _schedule_conversation_embedding_backfill(
         self, unit_texts: List[Tuple[Optional[str], str]]
@@ -6386,6 +9505,11 @@ class MemAgent:
         read must not prevent a newly requested mutation from reaching the
         model and its durable approval gate.
         """
+        # A cached string cannot prove that a tool was executed in this turn.
+        # Policies requiring fresh tool evidence therefore bypass lookup.
+        if self.completion_policy.enabled and self.completion_policy.require_tool_calls:
+            return "completion_policy_requires_fresh_tool_evidence"
+
         router = getattr(self, "semantic_tool_router", None)
         manager = getattr(self, "tool_manager", None)
         if router is None or manager is None:
@@ -6441,12 +9565,21 @@ class MemAgent:
         }
         domains.update(self._turn_cache_domains)
         tags = [str(item) for item in (context.get("cache_tags") or [])]
+        # Include all per-request context in cache admission/lookup identity.
+        # Session scoping prevents cross-thread reuse; this fingerprint also
+        # prevents stale reuse within one thread when page, selection, or other
+        # ephemeral grounding changes between otherwise identical questions.
+        request_context_fingerprint = self._fingerprint(context)
         return {
             "fingerprints": {
                 "model": self._fingerprint(model_value),
                 "prompt": self._fingerprint(prompt_value),
                 "tool_schema": self._fingerprint(tool_metadata),
+                "completion_policy": self._fingerprint(
+                    self.completion_policy.to_dict()
+                ),
                 "data_version": str(data_version),
+                "request_context": request_context_fingerprint,
             },
             "domain": sorted(domains)[0] if len(domains) == 1 else None,
             "domains": sorted(domains),
@@ -6613,6 +9746,195 @@ class MemAgent:
             return None
         return dict(self._last_context_window_stats)
 
+    def last_retrieval_evidence(self) -> Dict[str, Any]:
+        """Return source-safe evidence and timing from the most recent turn."""
+
+        return {
+            "items": [dict(item) for item in self._last_retrieved_memories],
+            **dict(self._last_retrieval_stats),
+        }
+
+    def last_memory_context_evidence(self) -> Dict[str, Any]:
+        """Return the content-free memory supply snapshot for the latest turn."""
+        return dict(self._last_memory_context_evidence or {})
+
+    def build_personalization_context(
+        self,
+        query: str,
+        *,
+        memory_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        preferences: Optional[Dict[str, Any]] = None,
+        writing_samples: Optional[List[Dict[str, Any]]] = None,
+        additional_memories: Optional[List[Dict[str, Any]]] = None,
+        policy: Optional[Any] = None,
+        exclude_thread_id: Optional[str] = None,
+    ):
+        """Build explicit, tenant-scoped personalization without running an LLM.
+
+        Cross-thread conversation recall occurs only when the supplied
+        :class:`~memorizz.personalization.PersonalizationPolicy` enables it and
+        both ``memory_id`` and ``user_id`` are bound.  Host preferences and
+        writing samples are accepted as already-authorized application data.
+        """
+        from ..personalization import (
+            PersonalizationContextBuilder,
+            PersonalizationPolicy,
+        )
+
+        resolved_policy = PersonalizationPolicy.from_value(policy)
+        resolved_memory_id = str(
+            memory_id
+            or self._current_memory_id
+            or (self.memory_ids[0] if self.memory_ids else "")
+        ).strip()
+        diagnostics: Dict[str, Any] = {
+            "retrieval_mode": "explicit",
+            "candidate_count": 0,
+            "selected_count": 0,
+            "entity_candidate_count": 0,
+            "entity_selected_count": 0,
+            "conversation_candidate_count": 0,
+            "conversation_selected_count": 0,
+            "fallback_used": False,
+            "degraded": False,
+            "degraded_reason": None,
+        }
+
+        entity_profiles: List[Dict[str, Any]] = []
+        if (
+            resolved_policy.include_entity_memory
+            and self.entity_memory_manager
+            and self.entity_memory_manager.is_enabled()
+            and resolved_memory_id
+            and resolved_policy.max_entity_profiles > 0
+        ):
+            try:
+                entity_result = (
+                    self.entity_memory_manager.build_context_with_diagnostics(
+                        query=(
+                            f"{query} current user profile role preferences "
+                            "audience goals"
+                        ),
+                        memory_id=resolved_memory_id,
+                        limit=resolved_policy.max_entity_profiles,
+                        user_id=user_id,
+                    )
+                )
+                entity_profiles = list(entity_result.get("profiles") or [])
+                entity_diagnostics = entity_result.get("retrieval") or {}
+                entity_candidate_count = int(
+                    (
+                        entity_diagnostics.get("fallback_candidate_count")
+                        if entity_diagnostics.get("fallback_used")
+                        else entity_diagnostics.get("semantic_match_count")
+                    )
+                    or 0
+                )
+                diagnostics["entity_candidate_count"] = entity_candidate_count
+                diagnostics["entity_selected_count"] = len(entity_profiles)
+                diagnostics["candidate_count"] += entity_candidate_count
+                diagnostics["fallback_used"] = bool(
+                    entity_diagnostics.get("fallback_used")
+                )
+                diagnostics["degraded"] = bool(entity_diagnostics.get("degraded"))
+                if entity_diagnostics.get("degraded_reason"):
+                    diagnostics["degraded_reason"] = entity_diagnostics.get(
+                        "degraded_reason"
+                    )
+            except Exception as exc:
+                diagnostics.update(
+                    {
+                        "degraded": True,
+                        "degraded_reason": "entity_retrieval_failed",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+
+        selected_memories: List[Dict[str, Any]] = []
+        if (
+            resolved_policy.conversation_recall
+            and resolved_policy.max_conversation_memories > 0
+            and resolved_policy.conversation_candidate_limit > 0
+        ):
+            if not resolved_memory_id or not str(user_id or "").strip():
+                diagnostics.update(
+                    {
+                        "degraded": True,
+                        "degraded_reason": "unbound_tenant_scope",
+                    }
+                )
+            elif self.memory_manager:
+                try:
+                    candidates = self.memory_manager.retrieve_relevant_memories(
+                        query=query,
+                        memory_type=MemoryType.CONVERSATION_MEMORY,
+                        memory_id=resolved_memory_id,
+                        limit=resolved_policy.conversation_candidate_limit,
+                        user_id=user_id,
+                        include_embedding=True,
+                    )
+                    if exclude_thread_id:
+                        wanted_exclusion = str(exclude_thread_id)
+
+                        def _thread(row: Dict[str, Any]) -> str:
+                            content = row.get("content")
+                            nested = content if isinstance(content, dict) else {}
+                            return str(
+                                row.get("thread_id")
+                                or row.get("conversation_id")
+                                or nested.get("thread_id")
+                                or nested.get("conversation_id")
+                                or ""
+                            )
+
+                        candidates = [
+                            row
+                            for row in candidates
+                            if _thread(row) != wanted_exclusion
+                        ]
+                    diagnostics["conversation_candidate_count"] = len(candidates)
+                    diagnostics["candidate_count"] += len(candidates)
+                    thresholded = []
+                    for row in candidates:
+                        try:
+                            score = float(row.get("score") or 0.0)
+                        except (TypeError, ValueError):
+                            score = 0.0
+                        if score >= resolved_policy.min_relevance_score:
+                            thresholded.append(("conversation", row))
+                    selected_memories = dedupe_and_select(
+                        thresholded,
+                        max_items=resolved_policy.max_conversation_memories,
+                        dedupe_parent_sources=True,
+                    )
+                    diagnostics["conversation_selected_count"] = len(selected_memories)
+                except Exception as exc:
+                    diagnostics.update(
+                        {
+                            "degraded": True,
+                            "degraded_reason": "conversation_retrieval_failed",
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+
+        for item in additional_memories or []:
+            if isinstance(item, dict) and self._memory_row_text(item):
+                selected_memories.append(dict(item))
+        selected_memories = selected_memories[
+            : resolved_policy.max_conversation_memories
+        ]
+        diagnostics["conversation_selected_count"] = len(selected_memories)
+        diagnostics["selected_count"] = len(entity_profiles) + len(selected_memories)
+
+        return PersonalizationContextBuilder(resolved_policy).build(
+            entity_profiles=entity_profiles,
+            preferences=preferences,
+            conversation_memories=selected_memories,
+            writing_samples=writing_samples,
+            diagnostics=diagnostics,
+        )
+
     def add_tool(self, tool, persist: bool = False):
         """Add a tool (delegated to tool manager)."""
         return self.tool_manager.add_tool(tool, persist)
@@ -6755,9 +10077,12 @@ class MemAgent:
 
         _close("sandbox", getattr(self, "sandbox_manager", None))
         _close("browser_control", getattr(self, "browser_control_manager", None))
+        if getattr(self, "_owns_meta_harness", False):
+            _close("meta_harness", getattr(self, "meta_harness", None))
         internet_manager = getattr(self, "internet_access_manager", None)
         _close("internet_access", getattr(internet_manager, "provider", None))
         _close("approval_store", self.approval_store)
+        _close("learning_control_plane", self.learning_control_plane)
         if close_model_provider:
             _close("model_provider", self.model)
         if close_memory_provider:

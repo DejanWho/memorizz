@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -26,6 +27,13 @@ from typing import (
 )
 
 from pydantic import TypeAdapter
+
+from .tool_outcomes import (
+    ToolOutcome,
+    ToolOutcomeStatus,
+    ToolResult,
+    normalize_tool_result,
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -60,13 +68,59 @@ def serialize_tool_result(value: Any) -> str:
         return str(value)
 
 
+def _inline_local_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a self-contained annotation schema with local refs expanded.
+
+    ``TypeAdapter`` places ``$defs`` beside the schema it generates. Tool
+    parameters are generated one annotation at a time, so leaving those defs
+    inside an individual property produces refs such as
+    ``#/$defs/EntityAttributeInput`` that incorrectly point at the eventual
+    tool-schema root. Inlining keeps provider tool schemas valid and makes the
+    nested fields explicit to the model. Recursive input models are deliberately
+    reduced to an object at the recursive edge; recursive tool arguments are not
+    a useful or safe model-facing contract.
+    """
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict) or not definitions:
+        return schema
+
+    def expand(value: Any, active: tuple[str, ...] = ()) -> Any:
+        if isinstance(value, list):
+            return [expand(item, active) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        ref = value.get("$ref")
+        prefix = "#/$defs/"
+        if isinstance(ref, str) and ref.startswith(prefix):
+            definition_name = ref[len(prefix) :]
+            overlay = {key: item for key, item in value.items() if key != "$ref"}
+            target = definitions.get(definition_name)
+            if isinstance(target, dict):
+                if definition_name in active:
+                    return {
+                        "type": "object",
+                        **{key: expand(item, active) for key, item in overlay.items()},
+                    }
+                return expand(
+                    {**target, **overlay},
+                    (*active, definition_name),
+                )
+
+        return {
+            key: expand(item, active) for key, item in value.items() if key != "$defs"
+        }
+
+    return expand(schema)
+
+
 def _schema_for_annotation(annotation: Any) -> Dict[str, Any]:
     if annotation is inspect.Parameter.empty:
         return {"type": "string"}
     try:
         schema = TypeAdapter(annotation).json_schema(mode="validation")
         if isinstance(schema, dict):
-            return schema
+            return _inline_local_schema_refs(schema)
     except Exception:
         pass
     mapping = {
@@ -384,6 +438,61 @@ class SemanticToolRouter:
     DISCOVERY_TOOL = "discover_tools"
     INVOCATION_TOOL = "invoke_tool"
 
+    @dataclass
+    class _TurnState:
+        selected: set[str] = field(default_factory=set)
+        call_attempts: Dict[str, int] = field(default_factory=dict)
+        successful_calls: set[str] = field(default_factory=set)
+        invocation_count: int = 0
+        active_user_id: Optional[str] = None
+
+    def _state(self) -> "SemanticToolRouter._TurnState":
+        state = self._turn_state_var.get()
+        if state is None:
+            state = self._TurnState()
+            self._turn_state_var.set(state)
+        return state
+
+    @property
+    def _selected(self) -> set[str]:
+        return self._state().selected
+
+    @_selected.setter
+    def _selected(self, value: Iterable[str]) -> None:
+        self._state().selected = set(value)
+
+    @property
+    def _call_attempts(self) -> Dict[str, int]:
+        return self._state().call_attempts
+
+    @_call_attempts.setter
+    def _call_attempts(self, value: Mapping[str, int]) -> None:
+        self._state().call_attempts = dict(value)
+
+    @property
+    def _successful_calls(self) -> set[str]:
+        return self._state().successful_calls
+
+    @_successful_calls.setter
+    def _successful_calls(self, value: Iterable[str]) -> None:
+        self._state().successful_calls = set(value)
+
+    @property
+    def _invocation_count(self) -> int:
+        return self._state().invocation_count
+
+    @_invocation_count.setter
+    def _invocation_count(self, value: int) -> None:
+        self._state().invocation_count = int(value)
+
+    @property
+    def _active_user_id(self) -> Optional[str]:
+        return self._state().active_user_id
+
+    @_active_user_id.setter
+    def _active_user_id(self, value: Optional[str]) -> None:
+        self._state().active_user_id = value
+
     def __init__(
         self,
         tool_manager: Any,
@@ -398,6 +507,9 @@ class SemanticToolRouter:
         max_invocations_per_turn: int = 20,
         max_attempts_per_call: int = 2,
     ) -> None:
+        self._turn_state_var: ContextVar[
+            Optional[SemanticToolRouter._TurnState]
+        ] = ContextVar(f"memorizz_router_turn_{id(self)}", default=None)
         self.tool_manager = tool_manager
         self.toolbox = toolbox
         self.agent_id = agent_id
@@ -418,11 +530,7 @@ class SemanticToolRouter:
         self._active_user_id: Optional[str] = None
 
     def begin_turn(self, *, user_id: Optional[str] = None) -> None:
-        self._selected = set()
-        self._call_attempts = {}
-        self._successful_calls = set()
-        self._invocation_count = 0
-        self._active_user_id = user_id
+        self._turn_state_var.set(self._TurnState(active_user_id=user_id))
 
     def _metadata(self) -> List[Dict[str, Any]]:
         values = self.tool_manager.get_tool_metadata() or []
@@ -609,7 +717,15 @@ class SemanticToolRouter:
         self, tool_name: str, arguments: Mapping[str, Any]
     ) -> tuple[str, Dict[str, Any], List[str]]:
         name = self._resolve_name(tool_name)
-        if name not in self._selected and name not in self.always_visible:
+        # With progressive disclosure disabled, ``schemas_for_turn`` exposes
+        # every registered tool. Invocation must mirror that contract rather
+        # than requiring a selection that can only be made through the hidden
+        # ``discover_tools`` meta-tool.
+        if (
+            self.enabled
+            and name not in self._selected
+            and name not in self.always_visible
+        ):
             raise PermissionError(
                 f"Tool '{name}' was not disclosed for this turn; call discover_tools first"
             )
@@ -652,12 +768,14 @@ class SemanticToolRouter:
             return prepared
         call_hash = str(prepared["call_hash"])
         result, _outcome = self.tool_manager.execute_tool(name, values)
-        failed = isinstance(result, str) and result.startswith("Error")
+        result, tool_outcome = normalize_tool_result(result)
+        failed = not tool_outcome.ok
         self.record_invocation(call_hash, success=not failed)
         return {
             "ok": not failed,
             "tool_name": name,
             "result": result,
+            "outcome": tool_outcome.to_dict(),
             "call_hash": call_hash,
             "warnings": warnings,
         }
@@ -728,10 +846,14 @@ class SemanticToolRouter:
 __all__ = [
     "ContextPolicy",
     "SemanticToolRouter",
+    "ToolOutcome",
+    "ToolOutcomeStatus",
     "ToolPolicy",
+    "ToolResult",
     "ToolResultPolicy",
     "callable_json_schema",
     "governed_tool",
+    "normalize_tool_result",
     "policy_for_callable",
     "serialize_tool_result",
     "tool_metadata_to_openai",

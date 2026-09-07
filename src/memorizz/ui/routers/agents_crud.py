@@ -16,6 +16,7 @@ behavior are unchanged. ``/agents/new`` stays registered before
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Form, HTTPException, Request
@@ -448,6 +449,14 @@ def _build_agent_form_data(agent: Any) -> Dict[str, Any]:
     skill_injection_role = _to_text(raw_skill_role).strip().lower()
     if skill_injection_role not in SKILL_INJECTION_ROLES:
         skill_injection_role = "user"
+    meta_harness_mode = (
+        _to_text(getattr(agent, "meta_harness_mode", "")).strip().lower()
+    )
+    if meta_harness_mode not in {"delegate", "runtime"}:
+        meta_harness_mode = ""
+    harness_config = getattr(agent, "harness_config", None)
+    if not isinstance(harness_config, dict):
+        harness_config = {}
 
     return {
         "agent_id": getattr(agent, "agent_id", ""),
@@ -463,6 +472,7 @@ def _build_agent_form_data(agent: Any) -> Dict[str, Any]:
         "tool_access": getattr(agent, "tool_access", None) or "private",
         "semantic_cache": bool(getattr(agent, "semantic_cache", False)),
         "continual_learning": bool(getattr(agent, "continual_learning", False)),
+        "learning_control_plane": bool(getattr(agent, "learning_control_plane", False)),
         "skill_injection_role": skill_injection_role,
         "continual_learning_require_shadow": bool(
             continual_learning_config.get("require_shadow", False)
@@ -482,6 +492,10 @@ def _build_agent_form_data(agent: Any) -> Dict[str, Any]:
         "llm_config_json": llm_config_json,
         "sandbox_provider": sandbox_val,
         "browser_control_provider": browser_control_val,
+        "meta_harness_mode": meta_harness_mode,
+        "default_harness": _to_text(getattr(agent, "default_harness", "auto")).strip()
+        or "auto",
+        "harness_workspace": _to_text(harness_config.get("workspace")).strip(),
         "internet_provider": internet_val,
         "skills_marketplace_provider": skills_marketplace_val,
         "skill_paths": getattr(agent, "skill_paths", None) or [],
@@ -597,7 +611,15 @@ async def agent_toggle_favorite(
         llm_config=getattr(existing, "llm_config", None),
         tools=getattr(existing, "tools", None),
         delegates=getattr(existing, "delegates", None),
+        embedding_config=getattr(existing, "embedding_config", None),
         semantic_cache_config=getattr(existing, "semantic_cache_config", None),
+        tool_result_policy=getattr(existing, "tool_result_policy", None),
+        context_policy=getattr(existing, "context_policy", None),
+        retrieval_policy=getattr(existing, "retrieval_policy", None),
+        delegation_config=getattr(existing, "delegation_config", None),
+        skill_retrieval=bool(getattr(existing, "skill_retrieval", False)),
+        skill_retrieval_config=getattr(existing, "skill_retrieval_config", None),
+        semantic_layer_config=getattr(existing, "semantic_layer_config", None),
         context_window_tokens=getattr(existing, "context_window_tokens", None),
         is_favorite=next_value,
         internet_access_provider=getattr(existing, "internet_access_provider", None),
@@ -615,8 +637,14 @@ async def agent_toggle_favorite(
         self_aware_config=getattr(existing, "self_aware_config", None),
         continual_learning=bool(getattr(existing, "continual_learning", False)),
         continual_learning_config=getattr(existing, "continual_learning_config", None),
+        learning_control_plane=bool(getattr(existing, "learning_control_plane", False)),
+        learning_control_plane_config=getattr(
+            existing, "learning_control_plane_config", None
+        ),
         automations_enabled=bool(getattr(existing, "automations_enabled", True)),
         default_timezone=getattr(existing, "default_timezone", None),
+        whatsapp_enabled=bool(getattr(existing, "whatsapp_enabled", False)),
+        whatsapp_config=getattr(existing, "whatsapp_config", None),
     )
 
     try:
@@ -667,6 +695,7 @@ async def agent_create_page(request: Request):
             "tool_access": "private",
             "semantic_cache": False,
             "continual_learning": False,
+            "learning_control_plane": False,
             "skill_injection_role": "user",
             "continual_learning_require_shadow": False,
             "continual_learning_shadow_evaluation": False,
@@ -682,6 +711,9 @@ async def agent_create_page(request: Request):
             "browser_control_provider": os.environ.get(
                 "MEMORIZZ_BROWSER_CONTROL_PROVIDER", ""
             ),
+            "meta_harness_mode": "",
+            "default_harness": "auto",
+            "harness_workspace": "",
             "internet_provider": os.environ.get(
                 "MEMORIZZ_DEFAULT_INTERNET_PROVIDER", ""
             ),
@@ -712,6 +744,7 @@ async def agent_create_submit(
     tool_access: str = Form("private"),
     semantic_cache: Optional[str] = Form(None),
     continual_learning: Optional[str] = Form(None),
+    learning_control_plane: Optional[str] = Form(None),
     skill_injection_role: str = Form("user"),
     continual_learning_require_shadow: Optional[str] = Form(None),
     continual_learning_shadow_evaluation: Optional[str] = Form(None),
@@ -727,6 +760,9 @@ async def agent_create_submit(
     llm_config_json: str = Form(""),
     sandbox_provider: str = Form(""),
     browser_control_provider: str = Form(""),
+    meta_harness_mode: str = Form(""),
+    default_harness: str = Form("auto"),
+    harness_workspace: str = Form(""),
     internet_provider: str = Form(""),
     skills_marketplace_provider: str = Form(""),
     self_aware: Optional[str] = Form(None),
@@ -757,6 +793,8 @@ async def agent_create_submit(
     memory_id_list = _parse_memory_ids(memory_ids)
     semantic_cache_enabled = _parse_bool(semantic_cache)
     continual_learning_enabled = _parse_bool(continual_learning)
+    learning_control_plane_enabled = _parse_bool(learning_control_plane)
+    learning_control_plane_config_value = {"enabled": learning_control_plane_enabled}
     continual_learning_require_shadow_value = _parse_bool(
         continual_learning_require_shadow
     )
@@ -815,6 +853,37 @@ async def agent_create_submit(
     browser_control_provider_value = _normalize_browser_control_provider_name(
         browser_control_provider
     )
+    meta_harness_mode_value = _to_text(meta_harness_mode).strip().lower()
+    if meta_harness_mode_value not in {"", "delegate", "runtime"} and not error:
+        error = "Meta-harness mode must be disabled, delegate, or runtime"
+    default_harness_value = (
+        _to_text(default_harness).strip().lower().replace("_", "-") or "auto"
+    )
+    if (
+        default_harness_value
+        not in {"auto", "codex", "claude-code", "openhands", "native"}
+        and not error
+    ):
+        error = "Default harness must be auto, codex, claude-code, openhands, or native"
+    harness_workspace_value = _to_text(harness_workspace).strip()
+    if harness_workspace_value and not error:
+        try:
+            resolved_harness_workspace = (
+                Path(harness_workspace_value).expanduser().resolve(strict=True)
+            )
+            if not resolved_harness_workspace.is_dir():
+                raise ValueError("not a directory")
+            harness_workspace_value = str(resolved_harness_workspace)
+        except (OSError, ValueError):
+            error = "Harness workspace must be an existing directory"
+    harness_config_value = (
+        {
+            "workspace": harness_workspace_value,
+            "permissions": {"allowed_roots": [harness_workspace_value]},
+        }
+        if harness_workspace_value
+        else {}
+    )
 
     if error:
         return templates.TemplateResponse(
@@ -836,6 +905,7 @@ async def agent_create_submit(
                 "tool_access": tool_access,
                 "semantic_cache": semantic_cache_enabled,
                 "continual_learning": continual_learning_enabled,
+                "learning_control_plane": learning_control_plane_enabled,
                 "skill_injection_role": skill_injection_role,
                 "continual_learning_require_shadow": (
                     continual_learning_require_shadow_value
@@ -854,6 +924,9 @@ async def agent_create_submit(
                 "llm_config_json": llm_config_json,
                 "sandbox_provider": sandbox_provider,
                 "browser_control_provider": browser_control_provider_value,
+                "meta_harness_mode": meta_harness_mode_value,
+                "default_harness": default_harness_value,
+                "harness_workspace": harness_workspace_value,
                 "internet_provider": internet_provider,
                 "skills_marketplace_provider": skills_marketplace_provider_value,
                 "enable_entity_memory": enable_entity_memory_value,
@@ -922,6 +995,7 @@ async def agent_create_submit(
                 "tool_access": tool_access,
                 "semantic_cache": semantic_cache_enabled,
                 "continual_learning": continual_learning_enabled,
+                "learning_control_plane": learning_control_plane_enabled,
                 "skill_injection_role": skill_injection_role,
                 "continual_learning_require_shadow": (
                     continual_learning_require_shadow_value
@@ -940,6 +1014,9 @@ async def agent_create_submit(
                 "llm_config_json": llm_config_json,
                 "sandbox_provider": sandbox_provider,
                 "browser_control_provider": browser_control_provider_value,
+                "meta_harness_mode": meta_harness_mode_value,
+                "default_harness": default_harness_value,
+                "harness_workspace": harness_workspace_value,
                 "internet_provider": internet_provider,
                 "skills_marketplace_provider": skills_marketplace_provider_value,
                 "enable_entity_memory": enable_entity_memory_value,
@@ -977,6 +1054,10 @@ async def agent_create_submit(
         llm_config=llm_config,
         sandbox_provider=sandbox_value,
         browser_control=browser_control_config,
+        meta_harness=bool(meta_harness_mode_value),
+        meta_harness_mode=meta_harness_mode_value or None,
+        default_harness=default_harness_value,
+        harness_config=harness_config_value,
         internet_access_provider=internet_value,
         internet_access_config=internet_config,
         skills_marketplace_provider=skills_marketplace_value,
@@ -985,6 +1066,8 @@ async def agent_create_submit(
         self_aware_config=self_aware_config_value,
         continual_learning=continual_learning_enabled,
         continual_learning_config=continual_learning_config_value,
+        learning_control_plane=learning_control_plane_enabled,
+        learning_control_plane_config=learning_control_plane_config_value,
         automations_enabled=automations_enabled_value,
         default_timezone=default_timezone_value,
         whatsapp_enabled=whatsapp_enabled_value,
@@ -1019,6 +1102,7 @@ async def agent_create_submit(
                 "tool_access": tool_access,
                 "semantic_cache": semantic_cache_enabled,
                 "continual_learning": continual_learning_enabled,
+                "learning_control_plane": learning_control_plane_enabled,
                 "skill_injection_role": skill_injection_role,
                 "continual_learning_require_shadow": (
                     continual_learning_require_shadow_value
@@ -1037,6 +1121,9 @@ async def agent_create_submit(
                 "llm_config_json": llm_config_json,
                 "sandbox_provider": sandbox_provider,
                 "browser_control_provider": browser_control_provider_value,
+                "meta_harness_mode": meta_harness_mode_value,
+                "default_harness": default_harness_value,
+                "harness_workspace": harness_workspace_value,
                 "internet_provider": internet_provider,
                 "skills_marketplace_provider": skills_marketplace_provider_value,
                 "enable_entity_memory": enable_entity_memory_value,
@@ -1096,6 +1183,7 @@ async def agent_edit_submit(
     tool_access: str = Form("private"),
     semantic_cache: Optional[str] = Form(None),
     continual_learning: Optional[str] = Form(None),
+    learning_control_plane: Optional[str] = Form(None),
     skill_injection_role: str = Form("user"),
     continual_learning_require_shadow: Optional[str] = Form(None),
     continual_learning_shadow_evaluation: Optional[str] = Form(None),
@@ -1111,6 +1199,9 @@ async def agent_edit_submit(
     llm_config_json: str = Form(""),
     sandbox_provider: str = Form(""),
     browser_control_provider: str = Form(""),
+    meta_harness_mode: str = Form(""),
+    default_harness: str = Form("auto"),
+    harness_workspace: str = Form(""),
     internet_provider: str = Form(""),
     skills_marketplace_provider: Optional[str] = Form(None),
     self_aware: Optional[str] = Form(None),
@@ -1145,6 +1236,16 @@ async def agent_edit_submit(
     memory_id_list = _parse_memory_ids(memory_ids)
     semantic_cache_enabled = _parse_bool(semantic_cache)
     continual_learning_enabled = _parse_bool(continual_learning)
+    learning_control_plane_enabled = _parse_bool(learning_control_plane)
+    existing_learning_control_plane_config = getattr(
+        existing, "learning_control_plane_config", None
+    )
+    learning_control_plane_config_value = (
+        dict(existing_learning_control_plane_config)
+        if isinstance(existing_learning_control_plane_config, dict)
+        else {}
+    )
+    learning_control_plane_config_value["enabled"] = learning_control_plane_enabled
     continual_learning_require_shadow_value = _parse_bool(
         continual_learning_require_shadow
     )
@@ -1249,6 +1350,43 @@ async def agent_edit_submit(
         and isinstance(existing_browser_control, dict)
         else None,
     )
+    meta_harness_mode_value = _to_text(meta_harness_mode).strip().lower()
+    if meta_harness_mode_value not in {"", "delegate", "runtime"} and not error:
+        error = "Meta-harness mode must be disabled, delegate, or runtime"
+    default_harness_value = (
+        _to_text(default_harness).strip().lower().replace("_", "-") or "auto"
+    )
+    if (
+        default_harness_value
+        not in {"auto", "codex", "claude-code", "openhands", "native"}
+        and not error
+    ):
+        error = "Default harness must be auto, codex, claude-code, openhands, or native"
+    harness_workspace_value = _to_text(harness_workspace).strip()
+    if harness_workspace_value and not error:
+        try:
+            resolved_harness_workspace = (
+                Path(harness_workspace_value).expanduser().resolve(strict=True)
+            )
+            if not resolved_harness_workspace.is_dir():
+                raise ValueError("not a directory")
+            harness_workspace_value = str(resolved_harness_workspace)
+        except (OSError, ValueError):
+            error = "Harness workspace must be an existing directory"
+    existing_harness_config = getattr(existing, "harness_config", None)
+    harness_config_value = (
+        dict(existing_harness_config)
+        if isinstance(existing_harness_config, dict)
+        else {}
+    )
+    if harness_workspace_value:
+        harness_config_value["workspace"] = harness_workspace_value
+        permissions_value = dict(harness_config_value.get("permissions") or {})
+        permissions_value["allowed_roots"] = [harness_workspace_value]
+        harness_config_value["permissions"] = permissions_value
+    else:
+        harness_config_value.pop("workspace", None)
+        harness_config_value.pop("permissions", None)
     form_override_data = {
         "instruction": instruction,
         "application_mode": application_mode,
@@ -1256,6 +1394,7 @@ async def agent_edit_submit(
         "tool_access": tool_access,
         "semantic_cache": semantic_cache_enabled,
         "continual_learning": continual_learning_enabled,
+        "learning_control_plane": learning_control_plane_enabled,
         "skill_injection_role": skill_injection_role,
         "continual_learning_require_shadow": (continual_learning_require_shadow_value),
         "continual_learning_shadow_evaluation": (
@@ -1273,6 +1412,9 @@ async def agent_edit_submit(
         "llm_config_json": llm_config_json,
         "sandbox_provider": sandbox_provider,
         "browser_control_provider": browser_control_provider_value,
+        "meta_harness_mode": meta_harness_mode_value,
+        "default_harness": default_harness_value,
+        "harness_workspace": harness_workspace_value,
         "internet_provider": internet_provider,
         "skills_marketplace_provider": skills_marketplace_provider_value,
         "enable_entity_memory": enable_entity_memory_value,
@@ -1463,7 +1605,15 @@ async def agent_edit_submit(
         llm_config=llm_config or getattr(existing, "llm_config", None),
         tools=getattr(existing, "tools", None),
         delegates=getattr(existing, "delegates", None),
+        embedding_config=getattr(existing, "embedding_config", None),
         semantic_cache_config=getattr(existing, "semantic_cache_config", None),
+        tool_result_policy=getattr(existing, "tool_result_policy", None),
+        context_policy=getattr(existing, "context_policy", None),
+        retrieval_policy=getattr(existing, "retrieval_policy", None),
+        delegation_config=getattr(existing, "delegation_config", None),
+        skill_retrieval=bool(getattr(existing, "skill_retrieval", False)),
+        skill_retrieval_config=getattr(existing, "skill_retrieval_config", None),
+        semantic_layer_config=getattr(existing, "semantic_layer_config", None),
         context_window_tokens=getattr(existing, "context_window_tokens", None),
         internet_access_provider=internet_value,
         internet_access_config=internet_config,
@@ -1472,12 +1622,18 @@ async def agent_edit_submit(
         knowledge_base_ids=getattr(existing, "knowledge_base_ids", None),
         sandbox_provider=sandbox_value,
         browser_control=browser_control_config_value,
+        meta_harness=bool(meta_harness_mode_value),
+        meta_harness_mode=meta_harness_mode_value or None,
+        default_harness=default_harness_value,
+        harness_config=harness_config_value,
         skill_paths=getattr(existing, "skill_paths", None),
         mcp_servers=getattr(existing, "mcp_servers", None),
         self_aware=self_aware_enabled_value,
         self_aware_config=self_aware_config_value,
         continual_learning=continual_learning_enabled,
         continual_learning_config=continual_learning_config_value,
+        learning_control_plane=learning_control_plane_enabled,
+        learning_control_plane_config=learning_control_plane_config_value,
         automations_enabled=automations_enabled_value,
         default_timezone=default_timezone_value,
         whatsapp_enabled=whatsapp_enabled_value,

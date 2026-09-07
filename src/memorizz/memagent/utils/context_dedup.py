@@ -63,6 +63,9 @@ _WORKFLOW_SOURCE_LABELS = frozenset(
     }
 )
 _PROVENANCE_FIELDS = (
+    "source_id",
+    "parent_source_id",
+    "linked_source_ids",
     "memory_type",
     "workflow_id",
     "canonical_hash",
@@ -193,7 +196,14 @@ def _candidate_timestamp(row: Any) -> Optional[float]:
 def _candidate_id(row: Any) -> str:
     if not isinstance(row, dict):
         return ""
-    for key in ("_id", "id", "memory_id", "summary_id"):
+    for key in (
+        "parent_source_id",
+        "source_id",
+        "_id",
+        "id",
+        "memory_id",
+        "summary_id",
+    ):
         value = row.get(key)
         if value:
             return str(value)
@@ -208,6 +218,15 @@ def _candidate_score(row: Any) -> float:
         return float(row.get("score") or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _provenance_width(row: Any) -> int:
+    linked = _field(row, "linked_source_ids")
+    if isinstance(linked, (list, tuple, set)):
+        values = {str(item) for item in linked if str(item)}
+        if values:
+            return len(values)
+    return int(bool(_field(row, "parent_source_id") or _field(row, "source_id")))
 
 
 def _field(value: Any, name: str) -> Any:
@@ -328,6 +347,8 @@ def dedupe_and_select(
     recency_weight: float = DEFAULT_RECENCY_WEIGHT,
     max_items: int = 5,
     max_chars_per_item: int = 600,
+    dedupe_parent_sources: bool = False,
+    selection_ledger: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Dedupe retrieved memory rows and select a diverse, budgeted subset.
 
@@ -346,6 +367,11 @@ def dedupe_and_select(
         Hard cap on selected memories (post-dedup).
     max_chars_per_item : int
         Rendered text is truncated to this many characters per memory.
+    dedupe_parent_sources : bool
+        Keep only the highest-scoring candidate for a shared parent source.
+        This is useful when an original record and a derived semantic record
+        are retrieved together. It is opt-in because independent chunks from
+        one long source can both be useful in general agent workloads.
 
     Returns
     -------
@@ -363,48 +389,116 @@ def dedupe_and_select(
         history_fingerprints.add(content_fingerprint(normalized))
         history_normalized.append(normalized)
 
-    seen_fingerprints: set = set()
+    fingerprint_indexes: Dict[str, int] = {}
     pool: List[Dict[str, Any]] = []
 
-    for source, row in candidates:
+    def mark(candidate, reason, selected=False):
+        entry = candidate.get("_decision")
+        if entry is not None:
+            entry.update(selection_reason=reason, selected=selected)
+
+    for rank, (source, row) in enumerate(candidates, 1):
+        decision = None
+        if selection_ledger is not None and len(selection_ledger) < 64:
+            from ...observability.privacy import pseudonym
+
+            score = _candidate_score(row)
+            decision = {
+                "resource": {
+                    "resource_type": "memory",
+                    "ref": pseudonym(
+                        _candidate_id(row) or content_fingerprint(candidate_text(row)),
+                        scope="memory-ref",
+                    ),
+                    "role": "retrieved_supporting_evidence",
+                },
+                "candidate_rank": rank,
+                "relevance_score": score if math.isfinite(score) else None,
+                "selected": False,
+                "selection_reason": "selection_not_observed",
+            }
+            selection_ledger.append(decision)
         text = candidate_text(row).strip()
         if not text:
+            if decision is not None:
+                decision["selection_reason"] = "not_ready"
             continue
         normalized = normalize_text(text)
         fingerprint = content_fingerprint(normalized)
 
-        # 1. Exact dedup across sources.
-        if fingerprint in seen_fingerprints:
-            continue
-
         # 2. Already in the conversation window (verbatim or contained).
         if fingerprint in history_fingerprints:
+            if decision is not None:
+                decision["selection_reason"] = "already_in_history"
             continue
         if any(normalized in h for h in history_normalized):
+            if decision is not None:
+                decision["selection_reason"] = "already_in_history"
             continue
 
-        seen_fingerprints.add(fingerprint)
-        pool.append(
-            {
-                "source": source,
-                "text": text,
-                "normalized": normalized,
-                "embedding": candidate_embedding(row),
-                "timestamp": _candidate_timestamp(row),
-                "id": _candidate_id(row),
-                "score": _candidate_score(row),
-                **_candidate_provenance(row),
-            }
-        )
+        shaped = {
+            "_decision": decision,
+            "source": source,
+            "text": text,
+            "normalized": normalized,
+            "embedding": candidate_embedding(row),
+            "timestamp": _candidate_timestamp(row),
+            "id": _candidate_id(row),
+            "score": _candidate_score(row),
+            **_candidate_provenance(row),
+        }
+
+        # 1. Exact dedup across sources and query variants. A later expanded
+        # query can return the same row with a stronger score; retain that
+        # evidence instead of freezing the first variant's weaker score.
+        existing_index = fingerprint_indexes.get(fingerprint)
+        if existing_index is not None:
+            current = pool[existing_index]
+            if shaped["score"] > current["score"]:
+                mark(current, "exact_duplicate")
+                pool[existing_index] = shaped
+            else:
+                mark(shaped, "exact_duplicate")
+            continue
+        fingerprint_indexes[fingerprint] = len(pool)
+        pool.append(shaped)
 
     if not pool:
         return []
 
     # 3. Near-duplicate dedup via stored embeddings (order: higher provider
     # score first so the better-ranked copy of a near-dup pair survives).
+    if dedupe_parent_sources:
+        representatives: Dict[str, Dict[str, Any]] = {}
+        ungrouped: List[Dict[str, Any]] = []
+        for candidate in pool:
+            identity = str(
+                candidate.get("parent_source_id") or candidate.get("source_id") or ""
+            ).strip()
+            if not identity:
+                ungrouped.append(candidate)
+                continue
+            current = representatives.get(identity)
+            if current is None or (_provenance_width(candidate), candidate["score"]) > (
+                _provenance_width(current),
+                current["score"],
+            ):
+                if current is not None:
+                    mark(current, "parent_source_duplicate")
+                representatives[identity] = candidate
+            else:
+                mark(candidate, "parent_source_duplicate")
+        pool = [*representatives.values(), *ungrouped]
     pool.sort(key=lambda c: (-c["score"], c["id"]))
     kept: List[Dict[str, Any]] = []
+    seen_parent_sources: set[str] = set()
     for cand in pool:
+        parent_source = str(
+            cand.get("parent_source_id") or cand.get("source_id") or ""
+        ).strip()
+        if dedupe_parent_sources and parent_source in seen_parent_sources:
+            mark(cand, "parent_source_duplicate")
+            continue
         is_dup = False
         if cand["embedding"] is not None:
             for other in kept:
@@ -416,6 +510,10 @@ def dedupe_and_select(
                     break
         if not is_dup:
             kept.append(cand)
+            if dedupe_parent_sources and parent_source:
+                seen_parent_sources.add(parent_source)
+        else:
+            mark(cand, "near_duplicate")
 
     # 4. Selection. With a query embedding, run MMR over relevance
     # (cosine-to-query blended with recency); otherwise fall back to the
@@ -429,6 +527,11 @@ def dedupe_and_select(
                 relevance = cosine_similarity(query_vec, cand["embedding"])
             if relevance is None:
                 relevance = cand["score"]
+            else:
+                # A candidate may have been found by a label-blind expanded
+                # query. Preserve that provider evidence instead of scoring it
+                # only against the less-specific original query.
+                relevance = max(relevance, cand["score"])
             recency = _recency_score(cand["timestamp"], now)
             cand["_relevance"] = (
                 1.0 - recency_weight
@@ -461,6 +564,15 @@ def dedupe_and_select(
             remaining.remove(best)
     else:
         selected = kept[:max_items]
+
+    for candidate in kept:
+        mark(candidate, "budget_exceeded")
+    for candidate in selected:
+        mark(
+            candidate,
+            "mmr_selected" if query_embedding is not None else "provider_rank_selected",
+            selected=True,
+        )
 
     # 5. Deterministic, chronology-preserving render order.
     selected.sort(key=lambda c: (c["timestamp"] or 0.0, c["id"], c["normalized"]))

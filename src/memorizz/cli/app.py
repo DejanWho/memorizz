@@ -19,6 +19,10 @@ import typer
 
 from .._env_io import resolve_oracle_in_database_embedding_from_env
 from . import config as cfg
+from .agent_commands import agents_app
+from .eval_commands import eval_app
+from .harness_commands import harness_app
+from .learning_commands import learning_app
 from .mcp_commands import mcp_app
 
 app = typer.Typer(
@@ -29,6 +33,10 @@ app = typer.Typer(
 )
 
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(learning_app, name="learning")
+app.add_typer(agents_app, name="agents")
+app.add_typer(harness_app, name="harness")
+app.add_typer(eval_app, name="eval")
 
 
 def _eprint(msg: str) -> None:
@@ -46,13 +54,12 @@ def _make_console():
 
 
 def _print_version() -> None:
-    try:
-        from importlib.metadata import version
+    # Use the package source of truth.  Distribution metadata can describe an
+    # older globally installed wheel when this command is run from a checkout
+    # through ``PYTHONPATH=src``.
+    from .. import __version__
 
-        v = version("memorizz")
-    except Exception:
-        v = "unknown"
-    print(f"memorizz {v}")
+    print(f"memorizz {__version__}")
 
 
 # --------------------------------------------------------------------------- #
@@ -108,6 +115,14 @@ def chat(
 def run(
     prompt: Optional[List[str]] = typer.Argument(None),
     code: bool = typer.Option(False, "--code", help="Enable coding tools."),
+    stream: bool = typer.Option(
+        True,
+        "--stream/--no-stream",
+        help="Stream by default; --no-stream waits for the complete reply.",
+    ),
+    output: str = typer.Option(
+        "text", "--output", help="Streaming output: text or jsonl."
+    ),
     browser_control: Optional[bool] = typer.Option(
         None,
         "--browser-control/--no-browser-control",
@@ -117,6 +132,18 @@ def run(
     if not prompt:
         _eprint('Usage: memorizz run "<prompt>"')
         raise typer.Exit(2)
+    if output not in {"text", "jsonl"} or (output != "text" and not stream):
+        _eprint("--output must be text or jsonl; jsonl requires --stream")
+        raise typer.Exit(2)
+    if stream:
+        _run_oneshot(
+            " ".join(prompt),
+            code_mode=code,
+            browser_control=browser_control,
+            stream=True,
+            output=output,
+        )
+        return
     _run_oneshot(
         " ".join(prompt),
         code_mode=code,
@@ -212,6 +239,7 @@ def oracle_preflight(
     raw_json: bool = typer.Option(False, "--json", help="Emit compact JSON."),
 ):
     """Run the package-owned structured Oracle preflight report."""
+    cfg.load_layered_env()
     from ..memory_provider.oracle import OracleProvider
 
     provider = OracleProvider.from_env(
@@ -408,7 +436,28 @@ def _launch_repl(
     run_repl(session)
 
 
-def _run_oneshot(text, code_mode=False, browser_control=None):
+def _run_oneshot(
+    text, code_mode=False, browser_control=None, *, stream=False, output="text"
+):
+    if stream:
+        from contextlib import redirect_stdout
+
+        from rich.console import Console
+
+        from .streaming import consume_stream
+
+        destination = sys.stdout
+        with redirect_stdout(sys.stderr):
+            _load_env()
+            session = _build_or_wizard(
+                code_mode, console=Console(stderr=True), browser_control=browser_control
+            )
+            if session is None:
+                raise typer.Exit(1)
+            code = consume_stream(session, text, output=output, stdout=destination)
+        if code:
+            raise typer.Exit(code)
+        return
     _load_env()
     console = _make_console()
     session = _build_or_wizard(
@@ -425,6 +474,22 @@ def _run_oneshot(text, code_mode=False, browser_control=None):
         user_id=session.user_id,
     )
     print(result)
+    outcome_labels = {
+        "empty": "completed with no results",
+        "degraded": "completed with limitations",
+        "fallback": "completed via fallback",
+        "provider_error": "provider error",
+        "error": "failed",
+    }
+    for outcome in getattr(session.agent, "last_tool_outcomes", []) or []:
+        status = str(outcome.get("status") or "success").lower()
+        if status == "success":
+            continue
+        tool_name = str(outcome.get("tool_name") or "tool")
+        console.print(
+            f"[yellow]tool outcome[/yellow] {tool_name}: "
+            f"{outcome_labels.get(status, status.replace('_', ' '))}"
+        )
     session.sync_ids()
     try:
         cfg.save_state(

@@ -270,6 +270,10 @@ CREATE TABLE knowledge_base (
     chunk_index NUMBER(10) DEFAULT 0,
     chunk_count NUMBER(10) DEFAULT 1,
     chunking_strategy VARCHAR2(32),
+    source_id VARCHAR2(512),                 -- Stable upstream/source provenance
+    parent_source_id VARCHAR2(512),          -- Parent chunk or original memory
+    linked_source_ids CLOB,                  -- JSON array for multi-source memories
+    metadata CLOB,                           -- JSON provenance and event metadata
     embedding VECTOR(256, FLOAT32),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -381,6 +385,7 @@ CREATE TABLE summaries (
     memory_id VARCHAR2(255),
     agent_id VARCHAR2(255),
     user_id VARCHAR2(255),                    -- Multi-tenant scope (NULL = legacy/anonymous)
+    thread_id VARCHAR2(255),                  -- Exact conversation scope
     period_start NUMBER,
     period_end NUMBER,
     memory_units_count NUMBER(10) DEFAULT 0,
@@ -393,6 +398,7 @@ CREATE INDEX idx_summaries_summary_id ON summaries(summary_id);
 CREATE INDEX idx_summaries_type ON summaries(summary_type);
 CREATE INDEX idx_summaries_memory_id ON summaries(memory_id);
 CREATE INDEX idx_summaries_agent_id ON summaries(agent_id);
+CREATE INDEX idx_summaries_memory_thread ON summaries(memory_id, thread_id);
 CREATE INDEX idx_summaries_user_id ON summaries(user_id);
 
 CREATE TABLE summary_message_links (
@@ -476,6 +482,8 @@ CREATE TABLE tool_log (
     result CLOB,
     success NUMBER(1) DEFAULT 1,
     error CLOB,
+    outcome VARCHAR2(32) DEFAULT 'success',
+    outcome_details CLOB,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     agent_id VARCHAR2(255),
     tool_call_id VARCHAR2(255),

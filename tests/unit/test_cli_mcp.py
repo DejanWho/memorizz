@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from memorizz import __version__
 from memorizz.cli.app import app
 
 SERVER = Path(__file__).parents[1] / "fixtures" / "mcp_stdio_server.py"
@@ -87,12 +88,34 @@ def test_cli_notion_and_google_presets_are_safe(tmp_path):
 
 
 @pytest.mark.unit
-def test_cli_capability_report_identifies_050_mcp_surface():
+def test_cli_capability_report_matches_current_mcp_surface():
     result = runner.invoke(app, ["capabilities", "--json"])
 
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
-    assert report["version"] == "0.5.1"
+    assert report["version"] == __version__
     assert report["features"]["mcp_client"]["available"] is True
     assert report["features"]["mcp_server"]["available"] is True
+    assert report["features"]["mcp_server"]["tool_count"] == 24
+    assert report["features"]["mcp_server"]["strict_input_schemas"] is True
+    assert report["features"]["agent_creation"] == {
+        "available": True,
+        "cli": True,
+        "mcp_local_stdio": True,
+        "mcp_remote_http": False,
+        "sdk": True,
+        "ui": True,
+    }
+    assert report["features"]["headless_runtime"] == {
+        "available": True,
+        "cli": True,
+        "display_server_required": False,
+        "mcp_stdio": True,
+        "sdk": True,
+        "ui_dependency_required": False,
+    }
+    assert (
+        "approval_decisions"
+        in report["features"]["agent_surface_parity"]["trusted_host_only"]
+    )
     assert report["features"]["durable_approvals"]["single_use"] is True

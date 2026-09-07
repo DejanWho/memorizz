@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
@@ -45,8 +45,10 @@ from .routers.agents_crud import router as agents_crud_router
 from .routers.continual_learning import router as continual_learning_router
 from .routers.evalground import router as evalground_router
 from .routers.evalground import stop_active_eval_run_processes
+from .routers.harnesses import router as harnesses_router
 from .routers.huggingface import router as huggingface_router
 from .routers.knowledge_base import router as knowledge_base_router
+from .routers.learning_control_plane import router as learning_control_plane_router
 from .routers.mcp import router as mcp_router
 from .routers.memory_pages import router as memory_pages_router
 from .routers.ollama import router as ollama_router
@@ -55,7 +57,8 @@ from .routers.playground import router as playground_router
 from .routers.traces import router as traces_router
 from .routers.vercel_skills import router as vercel_skills_router
 from .routers.whatsapp import router as whatsapp_router
-from .state import STATIC_DIR, UI_DIR, _state, templates
+from .security import ReadOnlyProviderProxy, UIAccessController, ui_read_only
+from .state import STATIC_DIR, UI_DIR, _state, close_meta_harness, templates
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +605,7 @@ async def lifespan(app: FastAPI):
 
     # Cleanup: stop any active Evalground benchmark subprocesses
     stop_active_eval_run_processes()
+    close_meta_harness()
     # Cleanup: close provider connection
     if _state["provider"]:
         try:
@@ -611,7 +615,9 @@ async def lifespan(app: FastAPI):
     logger.info("Memorizz UI shutting down...")
 
 
-def create_app() -> FastAPI:
+def create_app(
+    *, identity_resolver=None, artifact_resolver=None, resource_authorizer=None
+) -> FastAPI:
     """Create and configure the FastAPI application."""
     # Load layered env (~/.memorizz/.env, then $CWD/.env) so the UI sees the
     # same keys the CLI configured. override=False keeps real env vars winning.
@@ -622,6 +628,134 @@ def create_app() -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    access = UIAccessController()
+    app.state.trace_identity_resolver = identity_resolver
+    app.state.trace_artifact_resolver = artifact_resolver
+    app.state.trace_resource_authorizer = resource_authorizer
+    read_only_mode = ui_read_only()
+
+    from fastapi.exception_handlers import request_validation_exception_handler
+    from fastapi.exceptions import RequestValidationError
+
+    @app.exception_handler(RequestValidationError)
+    async def trace_validation_error(request, exc):
+        if request.url.path.startswith("/traces"):
+            # Never echo transient account addresses or rejected secret values.
+            return JSONResponse(
+                {"detail": "Invalid trace request"},
+                status_code=422,
+                headers={"Cache-Control": "no-store"},
+            )
+        return await request_validation_exception_handler(request, exc)
+
+    @app.middleware("http")
+    async def secure_local_ui(request: Request, call_next):
+        from .security import audit_trace_view
+        from .trace_access import current_principal
+
+        path = request.url.path
+        public_path = path == "/login" or path.startswith("/static/")
+        principal = access.principal_for_request(request)
+
+        def denied(detail, status_code=403):
+            audit_token = (
+                current_principal.set(principal) if principal is not None else None
+            )
+            try:
+                audit_trace_view(
+                    request, "trace_access_denied", content_mode="metadata"
+                )
+            finally:
+                if audit_token is not None:
+                    current_principal.reset(audit_token)
+            return JSONResponse(
+                {"detail": detail},
+                status_code=status_code,
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+
+        if (
+            access.enabled
+            and not public_path
+            and not access.request_is_authenticated(request)
+        ):
+            accepts_html = "text/html" in request.headers.get("accept", "")
+            if accepts_html:
+                safe_next = (
+                    path if path.startswith("/") and not path.startswith("//") else "/"
+                )
+                return RedirectResponse(url=f"/login?next={safe_next}", status_code=303)
+            return JSONResponse(
+                {"detail": "Memorizz UI authentication required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if (
+            read_only_mode
+            and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+            and path
+            not in {"/login", "/connect", "/traces/account/resolve", "/traces/reveal"}
+        ):
+            return denied("This Memorizz UI is running in read-only mode")
+        principal = access.principal_for_request(request)
+        if principal is not None and path.startswith("/traces"):
+            from dataclasses import replace
+
+            from ..observability.privacy import validate_opaque
+
+            updates = {}
+            for key in ("application_id", "user_id"):
+                if key not in request.query_params:
+                    continue
+                value = request.query_params[key]
+                try:
+                    validate_opaque(value)
+                    if not value or len(value) > 240:
+                        raise ValueError()
+                except ValueError:
+                    return denied("Invalid trace scope", 400)
+                if key in principal.filters() and principal.filters()[key] != value:
+                    return denied("Requested trace scope is not authorized")
+                updates[key] = value
+                if key == "user_id":
+                    updates["user_bound"] = True
+            if updates:
+                principal = replace(principal, **updates)
+        if principal is not None and principal.restricted and not public_path:
+            allowed_posts = {
+                "/traces/account/resolve",
+                "/traces/reveal",
+                "/traces/replays",
+            }
+            if not path.startswith("/traces") or (
+                request.method not in {"GET", "HEAD", "OPTIONS"}
+                and path not in allowed_posts
+            ):
+                return denied("This account is restricted to trace inspection")
+        # Prevent cross-origin form submissions to privileged trace actions.
+        if path.startswith("/traces") and request.method not in {
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        }:
+            origin = request.headers.get("origin")
+            if origin and origin != str(request.base_url).rstrip("/"):
+                return denied("Cross-origin trace action denied")
+        token = current_principal.set(principal) if principal is not None else None
+        try:
+            response = await call_next(request)
+            if path.startswith("/traces") and response.status_code in {401, 403}:
+                audit_trace_view(
+                    request, "trace_access_denied", content_mode="metadata"
+                )
+        finally:
+            if token is not None:
+                current_principal.reset(token)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        if path.startswith("/traces"):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
     # Mount static files
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -630,7 +764,12 @@ def create_app() -> FastAPI:
     app.include_router(oracle_docker_router)
     app.include_router(agents_api_router)
     app.include_router(traces_router)
+    from .routers.trace_tools import router as trace_tools_router
+
+    app.include_router(trace_tools_router)
     app.include_router(continual_learning_router)
+    app.include_router(learning_control_plane_router)
+    app.include_router(harnesses_router)
     app.include_router(memory_pages_router)
     app.include_router(mcp_router)
     app.include_router(vercel_skills_router)
@@ -661,6 +800,49 @@ def create_app() -> FastAPI:
     # Page Routes
     # -------------------------------------------------------------------------
 
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request, next: str = "/"):
+        if not access.enabled or access.request_is_authenticated(request):
+            return RedirectResponse(url="/", status_code=303)
+        next_path = next if next.startswith("/") and not next.startswith("//") else "/"
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": None, "next_path": next_path},
+        )
+
+    @app.post("/login", response_class=HTMLResponse)
+    async def login_submit(request: Request):
+        form = await request.form()
+        candidate = str(form.get("access_token") or "")
+        next_value = str(form.get("next") or "/")
+        next_path = (
+            next_value
+            if next_value.startswith("/") and not next_value.startswith("//")
+            else "/"
+        )
+        if not access.token_matches(candidate):
+            return templates.TemplateResponse(
+                "login.html",
+                {
+                    "request": request,
+                    "error": "Invalid access token.",
+                    "next_path": next_path,
+                },
+                status_code=401,
+            )
+        response = RedirectResponse(url=next_path, status_code=303)
+        response.set_cookie(
+            access.cookie_name,
+            access.issue_session(token=candidate),
+            max_age=access.ttl_seconds,
+            httponly=True,
+            secure=os.getenv("MEMORIZZ_UI_COOKIE_SECURE", "").strip().lower()
+            in {"1", "true", "yes", "on"},
+            samesite="strict",
+            path="/",
+        )
+        return response
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
         """Redirect to connect page or dashboard based on connection state."""
@@ -671,19 +853,24 @@ def create_app() -> FastAPI:
     @app.get("/connect", response_class=HTMLResponse)
     async def connect_page(request: Request):
         """Show the connection page."""
+        env_mongodb_uri = os.environ.get("MONGODB_URI", "")
+        provider_type = os.environ.get("MEMORIZZ_BACKEND", "").strip()
+        if not provider_type:
+            provider_type = "mongodb" if env_mongodb_uri else "oracle"
         return templates.TemplateResponse(
             "connect.html",
             {
                 "request": request,
                 "error": None,
-                "provider_type": os.environ.get("MEMORIZZ_BACKEND", "oracle"),
+                "provider_type": provider_type,
                 # Pre-fill from env vars so users don't have to re-type
                 "env_oracle_user": os.environ.get("ORACLE_USER", ""),
-                "env_oracle_password": os.environ.get("ORACLE_PASSWORD", ""),
+                "has_env_oracle_password": bool(os.environ.get("ORACLE_PASSWORD", "")),
                 "env_oracle_dsn": os.environ.get("ORACLE_DSN", ""),
                 "env_oracle_schema": os.environ.get("ORACLE_SCHEMA", ""),
-                "env_mongodb_uri": os.environ.get("MONGODB_URI", ""),
+                "has_env_mongodb_uri": bool(env_mongodb_uri),
                 "env_mongodb_db_name": os.environ.get("MONGODB_DB_NAME", ""),
+                "ui_read_only": read_only_mode,
             },
         )
 
@@ -708,13 +895,16 @@ def create_app() -> FastAPI:
             provider = None
 
             if provider_type == "oracle":
-                if not all([oracle_user, oracle_password, oracle_dsn]):
+                resolved_oracle_password = oracle_password or os.environ.get(
+                    "ORACLE_PASSWORD", ""
+                )
+                if not all([oracle_user, resolved_oracle_password, oracle_dsn]):
                     raise ValueError("Oracle requires user, password, and DSN")
                 from ..memory_provider.oracle import OracleConfig, OracleProvider
 
                 config = OracleConfig(
                     user=oracle_user,
-                    password=oracle_password,
+                    password=resolved_oracle_password,
                     dsn=oracle_dsn,
                     schema=oracle_schema or oracle_user,
                     lazy_vector_indexes=True,
@@ -738,24 +928,26 @@ def create_app() -> FastAPI:
                 }
                 _state["provider_secrets"] = {
                     "oracle_user": oracle_user,
-                    "oracle_password": oracle_password,
+                    "oracle_password": resolved_oracle_password,
                     "oracle_dsn": oracle_dsn,
                     "oracle_schema": oracle_schema or oracle_user,
                 }
 
             elif provider_type == "mongodb":
-                if not mongodb_uri:
+                resolved_mongodb_uri = mongodb_uri or os.environ.get("MONGODB_URI", "")
+                if not resolved_mongodb_uri:
                     raise ValueError("MongoDB requires a URI")
                 from ..memory_provider.mongodb import MongoDBConfig, MongoDBProvider
 
                 config = MongoDBConfig(
-                    uri=mongodb_uri,
+                    uri=resolved_mongodb_uri,
                     db_name=mongodb_db_name or "memorizz",
                     lazy_vector_indexes=True,
+                    read_only=read_only_mode,
                 )
                 provider = MongoDBProvider(config)
                 _state["connection_info"] = {
-                    "uri": _mask_uri(mongodb_uri),
+                    "uri": _mask_uri(resolved_mongodb_uri),
                     "db_name": mongodb_db_name or "memorizz",
                 }
                 _state["provider_secrets"] = {}
@@ -776,8 +968,13 @@ def create_app() -> FastAPI:
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 
+            if read_only_mode:
+                provider = ReadOnlyProviderProxy(provider)
+                _state["connection_info"]["access"] = "read-only"
+
             # Close existing provider if any
             if _state["provider"]:
+                close_meta_harness()
                 try:
                     _state["provider"].close()
                 except Exception:
@@ -785,6 +982,7 @@ def create_app() -> FastAPI:
 
             _state["provider"] = provider
             _state["provider_type"] = provider_type
+            _state["read_only"] = read_only_mode
             logger.info(f"Connected to {provider_type} provider")
 
             return RedirectResponse(url="/dashboard", status_code=302)
@@ -799,17 +997,21 @@ def create_app() -> FastAPI:
                     "error": error,
                     "provider_type": provider_type,
                     "env_oracle_user": os.environ.get("ORACLE_USER", ""),
-                    "env_oracle_password": os.environ.get("ORACLE_PASSWORD", ""),
+                    "has_env_oracle_password": bool(
+                        os.environ.get("ORACLE_PASSWORD", "")
+                    ),
                     "env_oracle_dsn": os.environ.get("ORACLE_DSN", ""),
                     "env_oracle_schema": os.environ.get("ORACLE_SCHEMA", ""),
-                    "env_mongodb_uri": os.environ.get("MONGODB_URI", ""),
+                    "has_env_mongodb_uri": bool(os.environ.get("MONGODB_URI", "")),
                     "env_mongodb_db_name": os.environ.get("MONGODB_DB_NAME", ""),
+                    "ui_read_only": read_only_mode,
                 },
             )
 
     @app.get("/disconnect")
     async def disconnect():
         """Disconnect from the current provider."""
+        close_meta_harness()
         if _state["provider"]:
             try:
                 _state["provider"].close()
@@ -819,6 +1021,7 @@ def create_app() -> FastAPI:
         _state["provider_type"] = None
         _state["connection_info"] = {}
         _state["provider_secrets"] = {}
+        _state["read_only"] = False
         return RedirectResponse(url="/connect", status_code=302)
 
     @app.get("/dashboard", response_class=HTMLResponse)
